@@ -4,12 +4,6 @@ data/
 *.csv
 *.json
 
-# Model files
-models/
-*.pkl
-*.joblib
-*.h5
-
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 */.ipynb_checkpoints/*
