@@ -7,6 +7,7 @@ import numpy as np
 import re
 from pathlib import Path
 import joblib
+import xgboost as xgb
 import json
 from typing import Tuple, Optional
 from sklearn.preprocessing import LabelEncoder
@@ -377,8 +378,34 @@ def save_model(model, model_path: str):
 
 
 def load_model(model_path: str):
-    """Load trained model from disk."""
-    return joblib.load(model_path)
+    """Load trained model from disk with XGBoost compatibility fallback.
+    - Tries joblib (pickle) first
+    - If XGBoost 'gpu_id' AttributeError occurs (version mismatch), tries JSON booster next to the pkl
+    - Raises a helpful RuntimeError with remediation steps if loading still fails
+    """
+    try:
+        return joblib.load(model_path)
+    except AttributeError as e:
+        msg = str(e).lower()
+        if 'gpu_id' in msg or 'xgbmodel' in msg:
+            # Attempt JSON fallback (if user exported booster for compatibility)
+            json_path = Path(model_path).with_suffix('.json')
+            try:
+                if json_path.exists():
+                    model = xgb.XGBRegressor()
+                    model.load_model(str(json_path))
+                    return model
+            except Exception:
+                pass
+            raise RuntimeError(
+                "XGBoost version mismatch detected while loading the model (gpu_id attribute not found). "
+                "Fix options: (1) Use Python 3.10/3.11 and install xgboost==1.7.6, then rerun; "
+                "(2) Retrain/resave the model with your current XGBoost version; "
+                "(3) From the training environment, export booster to JSON via model.get_booster().save_model('models/order_predictor.json') "
+                "and place it next to the .pkl — this app will auto-load the JSON."
+            ) from e
+        # Unknown AttributeError, bubble up
+        raise
 
 
 def validate_input_data(df: pd.DataFrame) -> dict:
