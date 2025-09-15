@@ -58,7 +58,7 @@ uvicorn app.api:app --host 0.0.0.0 --port 8000
 
 ```bash
 # Clone the repository
-git clone <repository-url>
+git clone https://github.com/Saran-Akshintala/pharm-demand-ops.git
 cd pharm-demand-ops
 
 # Create virtual environment
