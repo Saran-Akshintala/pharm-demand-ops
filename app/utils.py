@@ -9,7 +9,7 @@ from pathlib import Path
 import joblib
 import xgboost as xgb
 import json
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict, Any
 from sklearn.preprocessing import LabelEncoder
 
 
@@ -471,3 +471,439 @@ def validate_input_data(df: pd.DataFrame) -> dict:
         results['warnings'].append(f"Missing recommended columns: {missing_essential}")
     
     return results
+
+
+def apply_predicted_order_business_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[int, Dict[str, Any]]]:
+    """
+    Apply business rules to Predicted_Order column with priority-based highlighting.
+    
+    Args:
+        df: DataFrame with Predicted_Order and other required columns
+    
+    Returns:
+        Tuple of (modified_df, styling_info_dict)
+        styling_info_dict: {row_index: {'color': str, 'tooltip': str, 'display_value': str}}
+    """
+    df_result = df.copy()
+    styling_info = {}
+    
+    # Define color constants
+    COLORS = {
+        'reddish': '#ffcccc',     # Light red
+        'greenish': '#ccffcc',    # Light green  
+        'orangish': '#ffe6cc',    # Light orange
+        'yellowish': '#ffffcc'    # Light yellow
+    }
+    
+    # Priority order (highest first)
+    PRIORITY_ORDER = [
+        'days_over_90',       # 1. Days > 90 → Reddish
+        'uneven_sales',       # 2. Uneven sales pattern → Reddish
+        'negative_after_stock', # 3. Negative after Stock subtraction → Greenish
+        'box_adjustment',     # 4. Box adjustment within ±2 → Orangish
+        'low_customers'       # 5. No. of Customer Last Month ≤ 2 → Yellowish
+    ]
+    
+    for idx, row in df_result.iterrows():
+        conditions = {}
+        
+        # Get original predicted value (before any modifications)
+        original_predicted = row.get('Predicted_Base_Quantity', 0)
+        
+        # Rule 2: Adjust to nearest Box quantity
+        box_qty = row.get('Box', 1)  # Default to 1 if Box column missing
+        if pd.notna(box_qty) and box_qty > 0:
+            # Convert to numeric to handle string values
+            box_qty = pd.to_numeric(box_qty, errors='coerce')
+            if pd.notna(box_qty) and box_qty > 0:
+                # Round to nearest multiple of box quantity
+                # Example: original_predicted=28, box_qty=10 -> adjusted_to_box=30
+                adjusted_to_box = round(original_predicted / box_qty) * box_qty
+                box_diff = abs(original_predicted - adjusted_to_box)
+                
+                # Always highlight when adjustment is made (not just within ±2)
+                if box_diff > 0:
+                    conditions['box_adjustment'] = {
+                        'color': COLORS['orangish'],
+                        'tooltip': f'Adjusted to nearest Box qty (diff: ±{box_diff:.1f})'
+                    }
+            else:
+                adjusted_to_box = original_predicted
+        else:
+            adjusted_to_box = original_predicted
+        
+        # Rule 3: Subtract Stock from Predicted_Order
+        stock_qty = row.get('Stock', 0)
+        if pd.notna(stock_qty):
+            final_predicted = adjusted_to_box - stock_qty
+        else:
+            final_predicted = adjusted_to_box
+        
+        # Rule 3b: Check if negative after stock subtraction
+        if final_predicted < 0:
+            conditions['negative_after_stock'] = {
+                'color': COLORS['greenish'],
+                'tooltip': f'Negative after Stock subtraction ({final_predicted})'
+            }
+        
+        # Rule 3c: Check if result should be "No Order" - ONLY when stock truly covers the need
+        original_predicted = row.get('Predicted_Base_Quantity', 0)
+        stock_qty = row.get('Stock', 0)
+        
+        # "No Order" only applies in these specific cases:
+        # 1. Stock >= Predicted_Base_Quantity (stock fully covers need)
+        # 2. Predicted_Base_Quantity is 0 or very low (genuinely no demand)
+        should_be_no_order = False
+        tooltip_reason = ""
+        
+        if pd.notna(stock_qty) and stock_qty > 0 and stock_qty >= original_predicted and original_predicted > 0:
+            # Case 1: Stock fully covers the predicted need
+            should_be_no_order = True
+            tooltip_reason = f"In-Stock: Current stock ({stock_qty}) covers predicted need ({original_predicted})"
+        elif original_predicted <= 0:
+            # Case 2: Genuinely no demand predicted
+            should_be_no_order = True
+            tooltip_reason = f"Low demand: Predicted quantity ({original_predicted}) is very low"
+        
+        if should_be_no_order:
+            display_value = "No Order"
+            # Clear all existing conditions and create specific "No Order" tooltip
+            conditions.clear()
+            conditions['no_order'] = {
+                'color': None,  # No background color
+                'tooltip': tooltip_reason
+            }
+        elif final_predicted <= 0:
+            # If calculation results in ≤0 but we shouldn't show "No Order", 
+            # use the original predicted quantity (before stock subtraction)
+            final_predicted = original_predicted
+            display_value = None  # Will be set later with scheme logic
+        else:
+            display_value = None  # Will be set later with scheme logic
+        
+        # Rule 4: Check uneven sales patterns (repeating 1s or 2s)
+        sales_cols = ['L7', 'L15', 'L30', 'L45', 'L60', 'L75', 'L90']
+        available_sales = [col for col in sales_cols if col in df_result.columns]
+        
+        if available_sales:
+            sales_values = [row.get(col, 0) for col in available_sales]
+            # Convert to numeric and handle NaN
+            sales_values = [pd.to_numeric(val, errors='coerce') for val in sales_values]
+            sales_values = [val for val in sales_values if pd.notna(val)]
+            
+            if sales_values:
+                # Check for repeating patterns of 1 or 2
+                ones_count = sales_values.count(1)
+                twos_count = sales_values.count(2)
+                total_values = len(sales_values)
+                
+                # If more than 50% are 1s or 2s, consider it uneven
+                if (ones_count + twos_count) / total_values > 0.5:
+                    conditions['uneven_sales'] = {
+                        'color': COLORS['reddish'],
+                        'tooltip': f'High uneven sales pattern (1s: {ones_count}, 2s: {twos_count})'
+                    }
+        
+        # Rule 5: Check Days > 90
+        days_since_purchase = row.get('Days', 0)
+        if pd.notna(days_since_purchase) and days_since_purchase > 90:
+            conditions['days_over_90'] = {
+                'color': COLORS['reddish'],
+                'tooltip': f'Days since last purchase > 90 ({days_since_purchase})'
+            }
+        
+        # Rule 6: Check No. of Customer Last Month ≤ 2
+        # Try different possible column name variations
+        customer_count = None
+        customer_col_variations = [
+            'No_of_Customer_Last_Month', 
+            'No. of Customer Last Month',
+            'No of Customer Last Month',
+            'No_of_Customer_Last_Month_clean'
+        ]
+        
+        for col_name in customer_col_variations:
+            if col_name in df_result.columns:
+                customer_count = row.get(col_name)
+                break
+        
+        # If still not found, try case-insensitive search
+        if customer_count is None:
+            for col in df_result.columns:
+                if 'customer' in str(col).lower() and 'month' in str(col).lower():
+                    customer_count = row.get(col)
+                    break
+        
+        # Apply the rule only if we found a valid customer count
+        if customer_count is not None and pd.notna(customer_count):
+            try:
+                customer_count_num = pd.to_numeric(customer_count, errors='coerce')
+                if pd.notna(customer_count_num) and customer_count_num <= 2:
+                    conditions['low_customers'] = {
+                        'color': COLORS['yellowish'],
+                        'tooltip': f'Low customer count last month ({customer_count_num})'
+                    }
+            except:
+                pass
+        
+        # Apply Scm. scheme logic to the final predicted quantity (if not already set as "No Order")
+        if display_value is None:
+            display_value = apply_scheme_to_quantity(final_predicted, row, df_result)
+            
+            # Special constraint: If Days > 90, cap the order at Predicted_Base_Quantity
+            # This prevents over-ordering of potentially stale/slow-moving items
+            days_since_purchase = row.get('Days', 0)
+            if pd.notna(days_since_purchase) and days_since_purchase > 90:
+                # Parse the display_value to get total quantity
+                if '+' in str(display_value):
+                    # Handle scheme format like "10+2"
+                    try:
+                        parts = str(display_value).split('+')
+                        if len(parts) == 2:
+                            base_part = float(parts[0])
+                            bonus_part = float(parts[1])
+                            total_scheme_qty = base_part + bonus_part
+                            
+                            # If scheme total exceeds base prediction, cap it
+                            if total_scheme_qty > original_predicted:
+                                # Use the original predicted quantity instead
+                                display_value = str(int(original_predicted)) if original_predicted == int(original_predicted) else str(original_predicted)
+                                
+                                # Update the tooltip to reflect this capping
+                                if 'days_over_90' in conditions:
+                                    conditions['days_over_90']['tooltip'] = f'Days > 90 ({days_since_purchase}): Capped order at base quantity ({original_predicted}) instead of scheme quantity ({total_scheme_qty})'
+                    except:
+                        pass
+                else:
+                    # Handle simple numeric format
+                    try:
+                        numeric_value = float(display_value)
+                        if numeric_value > original_predicted:
+                            display_value = str(int(original_predicted)) if original_predicted == int(original_predicted) else str(original_predicted)
+                            
+                            # Update the tooltip to reflect this capping
+                            if 'days_over_90' in conditions:
+                                conditions['days_over_90']['tooltip'] = f'Days > 90 ({days_since_purchase}): Capped order at base quantity ({original_predicted}) instead of calculated quantity ({numeric_value})'
+                    except:
+                        pass
+        
+        # Apply priority-based conflict resolution
+        selected_condition = None
+        
+        # Special handling for "No Order" - always store tooltip but no color
+        if 'no_order' in conditions:
+            selected_condition = conditions['no_order']
+        else:
+            # Normal priority-based resolution for other conditions
+            for priority_key in PRIORITY_ORDER:
+                if priority_key in conditions:
+                    condition = conditions[priority_key]
+                    # Skip conditions that have color set to None
+                    if condition.get('color') is not None:
+                        selected_condition = condition
+                        break
+        
+        # Update the dataframe with final values
+        df_result.at[idx, 'Predicted_Order'] = display_value
+        
+        # Store styling information (including "No Order" tooltips)
+        if selected_condition:
+            styling_info[idx] = {
+                'color': selected_condition['color'],
+                'tooltip': selected_condition['tooltip'],
+                'display_value': display_value
+            }
+    
+    return df_result, styling_info
+
+
+def apply_scheme_to_quantity(final_quantity: float, row: pd.Series, df: pd.DataFrame) -> str:
+    """
+    Apply Scm. scheme logic to the final predicted quantity.
+    Intelligently rounds up to nearest scheme when beneficial.
+    
+    Args:
+        final_quantity: Final predicted quantity after business rules
+        row: Current row data
+        df: DataFrame containing the data
+    
+    Returns:
+        Formatted order string following the scheme pattern
+    """
+    # Check for Scm. column (note the period)
+    scm_col = None
+    for col in ['Scm', 'Scm.', 'scm', 'scm.']:
+        if col in df.columns:
+            scm_col = col
+            break
+    
+    if scm_col and pd.notna(row[scm_col]):
+        scm_value = str(row[scm_col]).strip()
+        
+        # Check for no scheme cases - use simple base quantity
+        if scm_value in ['0', '0+0', '', 'nan', 'null', 'none']:
+            return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
+        elif '+' in scm_value:
+            # Parse scheme pattern (e.g., "5+1", "2+1")
+            try:
+                scheme_parts = scm_value.split('+')
+                if len(scheme_parts) == 2:
+                    scheme_base = float(scheme_parts[0])
+                    scheme_bonus = float(scheme_parts[1])
+                    
+                    # If either part is 0, treat as no scheme
+                    if scheme_base == 0 or scheme_bonus == 0:
+                        return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
+                    else:
+                        total_scheme = scheme_base + scheme_bonus
+                        
+                        # Intelligent scheme application logic:
+                        # Apply proportional scheme based on final_quantity relative to scheme total
+                        
+                        # Case 1: Very small quantities (≤ 1) - return as-is
+                        if final_quantity <= 1:
+                            return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
+                        
+                        # Case 2: Find optimal scheme multiplier that gets closest to needed quantity
+                        # Calculate which multiple of the scheme gets closest to final_quantity
+                        
+                        # Helper functions
+                        def round_to_half(value):
+                            return round(value * 2) / 2
+                        
+                        def format_value(val):
+                            if val == int(val):
+                                return str(int(val))
+                            else:
+                                return f"{val:.1f}"
+                        
+                        # Analyze demand trend to influence multiplier selection
+                        sales_cols = ['L7', 'L15', 'L30', 'L45', 'L60', 'L75', 'L90']
+                        available_sales = [col for col in sales_cols if col in df.columns]
+                        
+                        demand_trend_factor = 1.0  # Default neutral
+                        
+                        if len(available_sales) >= 3:
+                            # Get sales values and calculate trend
+                            sales_values = []
+                            for col in available_sales:
+                                val = row.get(col, 0)
+                                if pd.notna(val):
+                                    sales_values.append(pd.to_numeric(val, errors='coerce'))
+                            
+                            # Remove NaN values
+                            sales_values = [val for val in sales_values if pd.notna(val)]
+                            
+                            if len(sales_values) >= 3:
+                                # Enhanced trend analysis: compare recent vs older sales AND check overall growth
+                                recent_avg = sum(sales_values[:2]) / 2 if len(sales_values) >= 2 else sales_values[0]
+                                older_avg = sum(sales_values[-2:]) / 2 if len(sales_values) >= 2 else sales_values[-1]
+                                
+                                # Also check overall growth pattern (first vs last)
+                                overall_growth = sales_values[0] / sales_values[-1] if sales_values[-1] > 0 else 1
+                                
+                                # Check for consistent growth across multiple periods
+                                growth_consistency = 0
+                                for i in range(len(sales_values) - 1):
+                                    if sales_values[i] > sales_values[i + 1]:
+                                        growth_consistency += 1
+                                
+                                consistency_ratio = growth_consistency / (len(sales_values) - 1) if len(sales_values) > 1 else 0
+                                
+                                if older_avg > 0:
+                                    trend_ratio = recent_avg / older_avg
+                                    
+                                    # Enhanced trend factor calculation
+                                    if trend_ratio < 0.7:  # Decreasing trend
+                                        demand_trend_factor = 0.8
+                                    elif trend_ratio > 2.0 and consistency_ratio > 0.6:  # Strong consistent growth
+                                        demand_trend_factor = 1.8  # Very aggressive for strong trends
+                                    elif trend_ratio > 1.5 and consistency_ratio > 0.5:  # Good growth
+                                        demand_trend_factor = 1.5  # More aggressive
+                                    elif trend_ratio > 1.3:  # Moderate growth
+                                        demand_trend_factor = 1.2  # Standard increase
+                        
+                        # Test valid scheme multipliers to find the best fit
+                        # Valid multipliers: 0.5x, 1x, 2x, 3x, 4x, 5x (maintaining base:bonus ratio)
+                        valid_multipliers = [0.5, 1, 2, 3, 4, 5]
+                        
+                        best_multiplier = 1
+                        best_score = float('inf')
+                        
+                        # Test each valid multiplier with trend consideration
+                        for test_mult in valid_multipliers:
+                            test_total = total_scheme * test_mult
+                            difference = abs(final_quantity - test_total)
+                            
+                            # Apply enhanced trend factor: more aggressive for strong growth
+                            if demand_trend_factor >= 1.8 and test_total > final_quantity:
+                                # Very strong bonus for higher quantities with strong growth
+                                adjusted_difference = difference * 0.4
+                            elif demand_trend_factor >= 1.5 and test_total > final_quantity:
+                                # Strong bonus for higher quantities with good growth
+                                adjusted_difference = difference * 0.5
+                            elif demand_trend_factor > 1.0 and test_total > final_quantity:
+                                # Standard bonus for higher quantities when demand is increasing
+                                adjusted_difference = difference * 0.7
+                            elif demand_trend_factor < 1.0 and test_total < final_quantity:
+                                # Bonus for lower quantities when demand is decreasing
+                                adjusted_difference = difference * 0.7
+                            else:
+                                adjusted_difference = difference
+                            
+                            if adjusted_difference < best_score:
+                                best_score = adjusted_difference
+                                best_multiplier = test_mult
+                        
+                        # Apply the best multiplier
+                        new_base = round_to_half(scheme_base * best_multiplier)
+                        new_bonus = round_to_half(scheme_bonus * best_multiplier)
+                        
+                        return f"{format_value(new_base)}+{format_value(new_bonus)}"
+                else:
+                    return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
+            except Exception:
+                return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
+        else:
+            # Single number or other format
+            return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
+    else:
+        # No Scm column - fallback to original logic using Order column
+        order_col = None
+        for col in df.columns:
+            col_lower = col.lower()
+            if col_lower in ['order', 'ord', 'oreder']:
+                order_col = col
+                break
+        
+        if order_col and pd.notna(row[order_col]):
+            try:
+                _, scheme_info = parse_order_scheme(str(row[order_col]))
+                return reconstruct_order_prediction(int(final_quantity), scheme_info)
+            except:
+                return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
+        else:
+            return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
+
+
+def detect_uneven_sales_pattern(sales_values: list) -> bool:
+    """
+    Detect if sales pattern shows high frequency of repeating low numbers (1, 2).
+    
+    Args:
+        sales_values: List of sales values from L7, L15, L30, etc.
+    
+    Returns:
+        True if pattern is considered uneven
+    """
+    if not sales_values or len(sales_values) < 3:
+        return False
+    
+    # Count occurrences of 1 and 2
+    ones_count = sales_values.count(1)
+    twos_count = sales_values.count(2)
+    total_count = len(sales_values)
+    
+    # If more than 50% of values are 1 or 2, consider it uneven
+    uneven_ratio = (ones_count + twos_count) / total_count
+    return uneven_ratio > 0.5

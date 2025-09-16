@@ -21,7 +21,8 @@ from utils import (
     load_model,
     parse_order_scheme,
     reconstruct_order_prediction,
-    validate_input_data
+    validate_input_data,
+    apply_predicted_order_business_rules
 )
 
 # Load custom CSS (deprecated) - default Streamlit styling only
@@ -60,7 +61,7 @@ def process_uploaded_file(uploaded_file):
             st.error("❌ Data validation failed:")
             for error in validation_results['errors']:
                 st.error(f"• {error}")
-            return None, None
+            return None, None, None
         
         if validation_results['warnings']:
             st.warning("⚠️ Data validation warnings:")
@@ -68,15 +69,21 @@ def process_uploaded_file(uploaded_file):
                 st.warning(f"• {warning}")
         
         # Load model and make predictions
-        model_path = Path("models/order_predictor.pkl")
+        script_dir = Path(__file__).parent.absolute()
+        
+        # Always use absolute path from script location
+        model_path = script_dir.parent / "models" / "order_predictor.pkl"
+        
+        
         if not model_path.exists():
             st.error("❌ Model not found. Please train the model first.")
-            return None, None
+            return None, None, None
         
         model = load_model(str(model_path))
         
         # Load model info for feature columns
-        model_info_path = Path("models/model_info.json")
+        model_info_path = script_dir.parent / "models" / "model_info.json"
+            
         if model_info_path.exists():
             with open(model_info_path) as f:
                 model_info = json.load(f)
@@ -196,7 +203,10 @@ def process_uploaded_file(uploaded_file):
         
         df_result['Predicted_Order'] = predicted_orders
         
-        # Reorder columns to place predictions next to Order column
+        # Apply business rules to Predicted_Order column
+        df_result, styling_info = apply_predicted_order_business_rules(df_result)
+        
+        # Reorder columns to place predictions next to Order column (fix from memory)
         order_col = None
         # Check for various order column name variations
         for col in df_result.columns:
@@ -206,6 +216,7 @@ def process_uploaded_file(uploaded_file):
                 break
         
         if order_col:
+            # Use df_result.columns (after adding predictions) instead of df.columns
             cols = list(df_result.columns)
             
             # Remove prediction columns from their current positions
@@ -221,11 +232,11 @@ def process_uploaded_file(uploaded_file):
             # Reorder the dataframe
             df_result = df_result.reindex(columns=cols)
         
-        return df_result, df_processed
+        return df_result, df_processed, styling_info
         
     except Exception as e:
         st.error(f"❌ Error processing file: {str(e)}")
-        return None, None
+        return None, None, None
 
 def create_visualizations(df_result, df_processed):
     """Create visualizations for the predictions"""
@@ -284,7 +295,9 @@ def main():
         
         # Try to load model info
         try:
-            model_info_path = Path("models/model_info.json")
+            script_dir = Path(__file__).parent.absolute()
+            model_info_path = script_dir.parent / "models" / "model_info.json"
+                
             if model_info_path.exists():
                 with open(model_info_path) as f:
                     model_info = json.load(f)
@@ -325,7 +338,11 @@ def main():
         
         # Process the file
         with st.spinner("🔄 Processing your data..."):
-            df_result, df_processed = process_uploaded_file(uploaded_file)
+            result = process_uploaded_file(uploaded_file)
+            if result[0] is not None:
+                df_result, df_processed, styling_info = result
+            else:
+                df_result, df_processed, styling_info = None, None, None
         
         if df_result is not None:
             st.success("✅ Predictions generated successfully!")
@@ -356,27 +373,115 @@ def main():
             # Add section divider
             st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
             
-            # Preview table before Download (Streamlit default styling)
+            # Preview table with business rule styling
             st.markdown("## 📋 Detailed Results (All Rows)")
-            cols_lower_map = {c.lower(): c for c in df_result.columns}
-            target_cols = ["name","order", "predicted_order", "ord", "oreder", "predicted_base_quantity"]
-            highlight_cols = [cols_lower_map[c] for c in target_cols if c in cols_lower_map]
-            if len(highlight_cols) > 0:
-                styler = df_result.style.set_properties(
-                    subset=highlight_cols,
-                    **{"background-color": "#fce5cd", "color": "black"}
-                )
-                st.dataframe(styler, use_container_width=True)
+            
+            # Apply styling based on business rules
+            def apply_business_rule_styling(df, styling_info):
+                styler = df.style
+                
+                # Apply business rule colors to Predicted_Order column
+                if 'Predicted_Order' in df.columns:
+                    for row_idx, style_info in styling_info.items():
+                        if row_idx < len(df):
+                            # Only apply background color if color is not None (skip "No Order" cases)
+                            if style_info.get('color') is not None:
+                                styler = styler.set_properties(
+                                    subset=pd.IndexSlice[row_idx, 'Predicted_Order'],
+                                    **{"background-color": style_info['color'], "color": "black"}
+                                )
+                
+                # Highlight key columns with light background
+                cols_lower_map = {c.lower(): c for c in df.columns}
+                target_cols = ["name", "order", "predicted_order", "predicted_base_quantity"]
+                highlight_cols = [cols_lower_map[c] for c in target_cols if c in cols_lower_map]
+                
+                if highlight_cols:
+                    # Apply light background to key columns (but don't override business rule colors)
+                    for col in highlight_cols:
+                        if col != 'Predicted_Order':  # Don't override business rule styling
+                            styler = styler.set_properties(
+                                subset=[col],
+                                **{"background-color": "#fce5cd", "color": "black"}
+                            )
+                
+                return styler
+            
+            if styling_info:
+                styled_df = apply_business_rule_styling(df_result, styling_info)
+                st.dataframe(styled_df, use_container_width=True)
+                
+                # Display tooltip information as expandable section
+                with st.expander("📝 View Highlighting Reasons", expanded=False):
+                    st.markdown("**Rows with business rule highlighting:**")
+                    tooltip_data = []
+                    for row_idx, style_info in styling_info.items():
+                        if row_idx < len(df_result):
+                            product_name = df_result.iloc[row_idx].get('Name', f'Row {row_idx + 1}')
+                            predicted_order = df_result.iloc[row_idx].get('Predicted_Order', 'N/A')
+                            tooltip_data.append({
+                                'Product': str(product_name)[:50] + '...' if len(str(product_name)) > 50 else str(product_name),
+                                'Predicted_Order': predicted_order,
+                                'Reason': style_info['tooltip']
+                            })
+                    
+                    if tooltip_data:
+                        tooltip_df = pd.DataFrame(tooltip_data)
+                        st.dataframe(tooltip_df, use_container_width=True, hide_index=True)
+                    else:
+                        st.info("No business rules triggered for this dataset.")
+                
+                # Add legend for colors
+                st.markdown("### 🎨 Color Legend")
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.markdown('<div style="background-color: #ffcccc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🔴 Reddish: Days > 90 / Uneven Sales</div>', unsafe_allow_html=True)
+                with col2:
+                    st.markdown('<div style="background-color: #ccffcc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟢 Greenish: Negative after Stock</div>', unsafe_allow_html=True)
+                with col3:
+                    st.markdown('<div style="background-color: #ffe6cc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟠 Orangish: Box Adjustment ±2</div>', unsafe_allow_html=True)
+                with col4:
+                    st.markdown('<div style="background-color: #ffffcc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟡 Yellowish: Low Customers ≤2</div>', unsafe_allow_html=True)
             else:
                 st.dataframe(df_result, use_container_width=True)
 
             # Download button
             st.markdown("### 💾 Download Results")
             
-            # Convert to Excel for download
+            # Convert to Excel for download with styling
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df_result.to_excel(writer, index=False, sheet_name='Predictions')
+                
+                # Apply styling to Excel file
+                if styling_info:
+                    from openpyxl.styles import PatternFill
+                    from openpyxl.comments import Comment
+                    
+                    worksheet = writer.sheets['Predictions']
+                    
+                    # Find Predicted_Order column
+                    predicted_order_col = None
+                    for col_idx, col_name in enumerate(df_result.columns, 1):
+                        if col_name == 'Predicted_Order':
+                            predicted_order_col = col_idx
+                            break
+                    
+                    if predicted_order_col:
+                        # Apply colors and comments
+                        for row_idx, style_info in styling_info.items():
+                            excel_row = row_idx + 2  # +2 because Excel is 1-indexed and has header
+                            cell = worksheet.cell(row=excel_row, column=predicted_order_col)
+                            
+                            # Only apply background color if color is not None (skip "No Order" cases)
+                            if style_info.get('color') is not None:
+                                color_hex = style_info['color'].replace('#', '')
+                                fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
+                                cell.fill = fill
+                            
+                            # Always add comment with tooltip (including "No Order" explanations)
+                            comment = Comment(style_info['tooltip'], 'Business Rules')
+                            cell.comment = comment
             
             excel_data = output.getvalue()
             
