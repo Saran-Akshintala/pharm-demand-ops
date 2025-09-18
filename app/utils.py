@@ -507,52 +507,29 @@ def apply_predicted_order_business_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame
     for idx, row in df_result.iterrows():
         conditions = {}
         
-        # Get original predicted value (before any modifications)
-        original_predicted = row.get('Predicted_Base_Quantity', 0)
-        
-        # Rule 2: Adjust to nearest Box quantity
-        box_qty = row.get('Box', 1)  # Default to 1 if Box column missing
-        if pd.notna(box_qty) and box_qty > 0:
-            # Convert to numeric to handle string values
-            box_qty = pd.to_numeric(box_qty, errors='coerce')
-            if pd.notna(box_qty) and box_qty > 0:
-                # Round to nearest multiple of box quantity
-                # Example: original_predicted=28, box_qty=10 -> adjusted_to_box=30
-                adjusted_to_box = round(original_predicted / box_qty) * box_qty
-                box_diff = abs(original_predicted - adjusted_to_box)
-                
-                # Always highlight when adjustment is made (not just within ±2)
-                if box_diff > 0:
-                    conditions['box_adjustment'] = {
-                        'color': COLORS['orangish'],
-                        'tooltip': f'Adjusted to nearest Box qty (diff: ±{box_diff:.1f})'
-                    }
-            else:
-                adjusted_to_box = original_predicted
-        else:
-            adjusted_to_box = original_predicted
-        
-        # Rule 3: Subtract Stock from Predicted_Order
-        stock_qty = row.get('Stock', 0)
-        if pd.notna(stock_qty):
-            final_predicted = adjusted_to_box - stock_qty
-        else:
-            final_predicted = adjusted_to_box
-        
-        # Rule 3b: Check if negative after stock subtraction
-        if final_predicted < 0:
-            conditions['negative_after_stock'] = {
-                'color': COLORS['greenish'],
-                'tooltip': f'Negative after Stock subtraction ({final_predicted})'
-            }
-        
-        # Rule 3c: Check if result should be "No Order" - ONLY when stock truly covers the need
+        # Get the current Predicted_Order value (already computed by our priority logic)
+        current_predicted_order = row.get('Predicted_Order', '0')
         original_predicted = row.get('Predicted_Base_Quantity', 0)
         stock_qty = row.get('Stock', 0)
         
-        # "No Order" only applies in these specific cases:
-        # 1. Stock >= Predicted_Base_Quantity (stock fully covers need)
-        # 2. Predicted_Base_Quantity is 0 or very low (genuinely no demand)
+        # Parse current predicted order to get numeric value for analysis
+        if '+' in str(current_predicted_order):
+            # Handle scheme format like "5+1"
+            try:
+                parts = str(current_predicted_order).split('+')
+                if len(parts) == 2:
+                    current_order_numeric = float(parts[0]) + float(parts[1])
+                else:
+                    current_order_numeric = float(current_predicted_order)
+            except:
+                current_order_numeric = 0
+        else:
+            try:
+                current_order_numeric = float(current_predicted_order)
+            except:
+                current_order_numeric = 0
+        
+        # Check for "No Order" cases (when stock fully covers need)
         should_be_no_order = False
         tooltip_reason = ""
         
@@ -573,13 +550,35 @@ def apply_predicted_order_business_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame
                 'color': None,  # No background color
                 'tooltip': tooltip_reason
             }
-        elif final_predicted <= 0:
-            # If calculation results in ≤0 but we shouldn't show "No Order", 
-            # use the original predicted quantity (before stock subtraction)
-            final_predicted = original_predicted
-            display_value = None  # Will be set later with scheme logic
         else:
-            display_value = None  # Will be set later with scheme logic
+            # Use the already computed Predicted_Order value
+            display_value = current_predicted_order
+            
+            # Check for box adjustment highlighting (for display purposes only)
+            box_qty = row.get('Box', None)
+            if pd.notna(box_qty) and box_qty > 0:
+                try:
+                    box_qty = float(box_qty)
+                    after_stock_subtraction = original_predicted - stock_qty
+                    if after_stock_subtraction > 0:
+                        # Check if box adjustment was applied
+                        box_diff = abs(after_stock_subtraction - box_qty)
+                        if box_diff <= 2 and abs(current_order_numeric - box_qty) < 0.1:
+                            conditions['box_adjustment'] = {
+                                'color': COLORS['orangish'],
+                                'tooltip': f'Adjusted to Box quantity: {after_stock_subtraction} → {box_qty}'
+                            }
+                except:
+                    pass
+            
+            # Check if negative after stock subtraction (should not happen with new logic)
+            if current_order_numeric < 0:
+                conditions['negative_after_stock'] = {
+                    'color': COLORS['greenish'],
+                    'tooltip': f'Negative result: {current_order_numeric}'
+                }
+        # Note: final_predicted and display_value logic removed since we now use 
+        # the pre-computed Predicted_Order from our priority-based logic
         
         # Rule 4: Check uneven sales patterns (repeating 1s or 2s)
         sales_cols = ['L7', 'L15', 'L30', 'L45', 'L60', 'L75', 'L90']
@@ -646,46 +645,20 @@ def apply_predicted_order_business_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame
             except:
                 pass
         
-        # Apply Scm. scheme logic to the final predicted quantity (if not already set as "No Order")
-        if display_value is None:
-            display_value = apply_scheme_to_quantity(final_predicted, row, df_result)
-            
-            # Special constraint: If Days > 90, cap the order at Predicted_Base_Quantity
-            # This prevents over-ordering of potentially stale/slow-moving items
-            days_since_purchase = row.get('Days', 0)
-            if pd.notna(days_since_purchase) and days_since_purchase > 90:
-                # Parse the display_value to get total quantity
-                if '+' in str(display_value):
-                    # Handle scheme format like "10+2"
-                    try:
-                        parts = str(display_value).split('+')
-                        if len(parts) == 2:
-                            base_part = float(parts[0])
-                            bonus_part = float(parts[1])
-                            total_scheme_qty = base_part + bonus_part
-                            
-                            # If scheme total exceeds base prediction, cap it
-                            if total_scheme_qty > original_predicted:
-                                # Use the original predicted quantity instead
-                                display_value = str(int(original_predicted)) if original_predicted == int(original_predicted) else str(original_predicted)
-                                
-                                # Update the tooltip to reflect this capping
-                                if 'days_over_90' in conditions:
-                                    conditions['days_over_90']['tooltip'] = f'Days > 90 ({days_since_purchase}): Capped order at base quantity ({original_predicted}) instead of scheme quantity ({total_scheme_qty})'
-                    except:
-                        pass
-                else:
-                    # Handle simple numeric format
-                    try:
-                        numeric_value = float(display_value)
-                        if numeric_value > original_predicted:
-                            display_value = str(int(original_predicted)) if original_predicted == int(original_predicted) else str(original_predicted)
-                            
-                            # Update the tooltip to reflect this capping
-                            if 'days_over_90' in conditions:
-                                conditions['days_over_90']['tooltip'] = f'Days > 90 ({days_since_purchase}): Capped order at base quantity ({original_predicted}) instead of calculated quantity ({numeric_value})'
-                    except:
-                        pass
+        # Check for Days > 90 constraint (should already be handled in our priority logic, but check for highlighting)
+        days_since_purchase = row.get('Days', 0)
+        if pd.notna(days_since_purchase) and days_since_purchase > 90:
+            # Check if the current order exceeds base quantity (for highlighting only)
+            if current_order_numeric > original_predicted:
+                conditions['days_over_90'] = {
+                    'color': COLORS['reddish'],
+                    'tooltip': f'Days > 90 ({days_since_purchase}): Should be capped at base quantity ({original_predicted})'
+                }
+            else:
+                conditions['days_over_90'] = {
+                    'color': COLORS['reddish'],
+                    'tooltip': f'Days since last purchase > 90 ({days_since_purchase})'
+                }
         
         # Apply priority-based conflict resolution
         selected_condition = None
@@ -1133,48 +1106,32 @@ def _apply_scheme_adjustment_new(predicted_order_qty: float, row: pd.Series, df:
             bonus_str = str(int(scheme_bonus)) if scheme_bonus == int(scheme_bonus) else f"{scheme_bonus:.1f}"
             return f"{base_str}+{bonus_str}"
         
-        # Try to find a proportional scheme that results in a whole number
-        # and is within tolerance of predicted_order_qty
+        # Find the best valid multiplier (0.5x, 1x, 2x, 3x, 4x, 5x) that gets closest to predicted_order_qty
+        # Valid multipliers maintain the original base:bonus ratio
         
-        # Test different multipliers to find one that gives a whole number total
-        # and is close to predicted_order_qty
+        valid_multipliers = [0.5, 1, 2, 3, 4, 5]  # Only these multipliers are allowed
         best_scheme = None
         best_difference = float('inf')
         
-        # Test multipliers from 0.1 to 5.0 in increments of 0.1
-        for multiplier in [i/10.0 for i in range(1, 51)]:
+        for multiplier in valid_multipliers:
             test_base = scheme_base * multiplier
             test_bonus = scheme_bonus * multiplier
             test_total = test_base + test_bonus
             
-            # Check if total is a whole number (or very close to one)
-            if abs(test_total - round(test_total)) < 0.001:
-                test_total_rounded = round(test_total)
-                diff = abs(predicted_order_qty - test_total_rounded)
-                
-                if diff <= tolerance and diff < best_difference:
-                    best_difference = diff
-                    # Adjust base and bonus to ensure they sum to the whole number
-                    # Keep the original ratio but adjust to sum to whole number
-                    ratio = scheme_base / (scheme_base + scheme_bonus)
-                    adjusted_base = test_total_rounded * ratio
-                    adjusted_bonus = test_total_rounded * (1 - ratio)
-                    
-                    # Round to reasonable precision
-                    adjusted_base = round(adjusted_base * 2) / 2  # Round to nearest 0.5
-                    adjusted_bonus = round(adjusted_bonus * 2) / 2  # Round to nearest 0.5
-                    
-                    # Ensure they still sum to whole number
-                    if abs((adjusted_base + adjusted_bonus) - test_total_rounded) > 0.1:
-                        # Adjust bonus to make sum exact
-                        adjusted_bonus = test_total_rounded - adjusted_base
-                    
-                    best_scheme = (adjusted_base, adjusted_bonus)
+            # Check if this multiplier gets us close to predicted_order_qty
+            diff = abs(predicted_order_qty - test_total)
+            
+            if diff <= tolerance and diff < best_difference:
+                best_difference = diff
+                best_scheme = (test_base, test_bonus, multiplier)
         
         if best_scheme:
-            base_val, bonus_val = best_scheme
+            base_val, bonus_val, used_multiplier = best_scheme
+            
+            # Format the values properly
             base_str = str(int(base_val)) if base_val == int(base_val) else f"{base_val:.1f}"
             bonus_str = str(int(bonus_val)) if bonus_val == int(bonus_val) else f"{bonus_val:.1f}"
+            
             return f"{base_str}+{bonus_str}"
         
         # If no suitable scheme found, return as simple number
