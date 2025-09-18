@@ -708,8 +708,16 @@ def apply_expiry_highlighting(df: pd.DataFrame) -> Dict[int, Dict[str, Any]]:
     """
     Apply highlighting to Expiry column for medicines expiring in ≤ 5 months.
     
+    Supports MM/YY format (e.g., "03/25" for March 2025) as well as other date formats.
+    For MM/YY format, assumes expiry on the last day of the specified month.
+    
+    Color coding:
+    - Red (#ffcccc): ≤ 1 month (URGENT)
+    - Orange (#ffe6cc): ≤ 3 months (Soon)
+    - Yellow (#fff2cc): ≤ 5 months (Moderate)
+    
     Args:
-        df: DataFrame with Expiry column
+        df: DataFrame with Expiry column containing MM/YY format dates
     
     Returns:
         Dict with styling info for Expiry column: {row_index: {'color': str, 'tooltip': str}}
@@ -748,9 +756,32 @@ def apply_expiry_highlighting(df: pd.DataFrame) -> Dict[int, Dict[str, Any]]:
             continue
         
         try:
-            # Try to parse the expiry date
+            # Handle MM/YY format specifically
             if isinstance(expiry_value, str):
-                expiry_date = dateutil.parser.parse(expiry_value)
+                expiry_str = expiry_value.strip()
+                
+                # Check if it's MM/YY format (e.g., "03/25", "12/24")
+                if '/' in expiry_str and len(expiry_str.split('/')) == 2:
+                    parts = expiry_str.split('/')
+                    if len(parts[0]) <= 2 and len(parts[1]) <= 2:
+                        # MM/YY format - assume last day of the month
+                        month = int(parts[0])
+                        year = int(parts[1])
+                        
+                        # Convert 2-digit year to 4-digit (assume 20xx for years 00-99)
+                        if year < 100:
+                            year = 2000 + year
+                        
+                        # Create date as last day of the expiry month
+                        from calendar import monthrange
+                        last_day = monthrange(year, month)[1]
+                        expiry_date = datetime(year, month, last_day)
+                    else:
+                        # Try general parsing for other formats
+                        expiry_date = dateutil.parser.parse(expiry_value)
+                else:
+                    # Try general parsing for other formats
+                    expiry_date = dateutil.parser.parse(expiry_value)
             elif hasattr(expiry_value, 'date'):
                 expiry_date = expiry_value
             else:
