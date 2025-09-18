@@ -907,3 +907,475 @@ def detect_uneven_sales_pattern(sales_values: list) -> bool:
     # If more than 50% of values are 1 or 2, consider it uneven
     uneven_ratio = (ones_count + twos_count) / total_count
     return uneven_ratio > 0.5
+
+
+def compute_predicted_order_with_adjustments(
+    df: pd.DataFrame, 
+    apply_box: bool = True, 
+    box_tolerance: int = 2,
+    apply_scm: bool = True, 
+    scm_tolerance: int = 2
+) -> pd.DataFrame:
+    """
+    Compute Predicted_Order from Predicted_Base_Quantity with specific priority rules.
+    
+    Priority Order:
+    1. Predicted_Order = Predicted_Base_Quantity - Stock
+    2. Box adjustment (±tolerance to fit box quantity)
+    3. Scheme adjustment (±tolerance to fit scheme, ensuring whole numbers)
+    
+    Args:
+        df: DataFrame with Predicted_Base_Quantity and other required columns
+        apply_box: Whether to apply box quantity adjustments
+        box_tolerance: Tolerance for box quantity adjustments (±tolerance)
+        apply_scm: Whether to apply scheme adjustments
+        scm_tolerance: Tolerance for scheme adjustments (±tolerance)
+    
+    Returns:
+        DataFrame with updated Predicted_Order column
+    """
+    df_result = df.copy()
+    
+    # Ensure Predicted_Base_Quantity exists
+    if 'Predicted_Base_Quantity' not in df_result.columns:
+        raise ValueError("Predicted_Base_Quantity column is required")
+    
+    predicted_orders = []
+    
+    for idx, row in df_result.iterrows():
+        base_qty = row.get('Predicted_Base_Quantity', 0)
+        stock_qty = row.get('Stock', 0)
+        
+        # Ensure values are numeric
+        if pd.isna(base_qty):
+            base_qty = 0
+        else:
+            base_qty = float(base_qty)
+            
+        if pd.isna(stock_qty):
+            stock_qty = 0
+        else:
+            stock_qty = float(stock_qty)
+        
+        # Step 1: Predicted_Order = Predicted_Base_Quantity - Stock
+        predicted_order_qty = base_qty - stock_qty
+        
+        # If result is negative or zero, handle appropriately
+        if predicted_order_qty <= 0:
+            predicted_orders.append("0")
+            continue
+        
+        # Step 2: Apply box quantity adjustment if enabled
+        if apply_box:
+            predicted_order_qty = _apply_box_adjustment_new(predicted_order_qty, row, box_tolerance)
+        
+        # Step 3: Apply scheme adjustment if enabled
+        if apply_scm:
+            final_order = _apply_scheme_adjustment_new(predicted_order_qty, row, df_result, scm_tolerance)
+        else:
+            # Format as integer if whole number, otherwise as decimal
+            if predicted_order_qty == int(predicted_order_qty):
+                final_order = str(int(predicted_order_qty))
+            else:
+                final_order = f"{predicted_order_qty:.1f}"
+        
+        predicted_orders.append(final_order)
+    
+    df_result['Predicted_Order'] = predicted_orders
+    return df_result
+
+
+def _apply_box_adjustment_new(predicted_order_qty: float, row: pd.Series, tolerance: int) -> float:
+    """
+    Apply box quantity adjustment to predicted order quantity after stock subtraction.
+    
+    Rule: If predicted order quantity is within ±tolerance of box quantity, 
+    adjust to box quantity to fit into box.
+    
+    Args:
+        predicted_order_qty: Quantity after stock subtraction
+        row: Current row data
+        tolerance: Tolerance for box adjustments (±tolerance)
+    
+    Returns:
+        Adjusted quantity based on box size
+    """
+    box_qty = row.get('Box', None)
+    
+    # Handle missing or invalid box quantities
+    if pd.isna(box_qty) or box_qty is None:
+        return predicted_order_qty
+    
+    try:
+        box_qty = float(box_qty)
+        if box_qty <= 0:
+            return predicted_order_qty
+    except (ValueError, TypeError):
+        return predicted_order_qty
+    
+    # Check if predicted order quantity is within tolerance of box quantity
+    difference = abs(predicted_order_qty - box_qty)
+    
+    if difference <= tolerance:
+        # Adjust to box quantity
+        return box_qty
+    else:
+        # Keep original quantity if not within tolerance
+        return predicted_order_qty
+
+
+def _apply_box_adjustment(base_qty: float, row: pd.Series, tolerance: int) -> float:
+    """
+    Legacy box adjustment function - kept for backward compatibility.
+    
+    Args:
+        base_qty: Base predicted quantity
+        row: Current row data
+        tolerance: Tolerance for box adjustments (±tolerance)
+    
+    Returns:
+        Adjusted quantity based on box size
+    """
+    box_qty = row.get('Box', 1)
+    
+    # Handle missing or invalid box quantities
+    if pd.isna(box_qty) or box_qty <= 0:
+        return base_qty
+    
+    try:
+        box_qty = float(box_qty)
+    except (ValueError, TypeError):
+        return base_qty
+    
+    # Round to nearest multiple of box quantity
+    adjusted_qty = round(base_qty / box_qty) * box_qty
+    
+    # Check if adjustment is within tolerance
+    difference = abs(base_qty - adjusted_qty)
+    if difference <= tolerance:
+        return adjusted_qty
+    else:
+        # If difference exceeds tolerance, return original quantity
+        return base_qty
+
+
+def _apply_scheme_adjustment_new(predicted_order_qty: float, row: pd.Series, df: pd.DataFrame, tolerance: int) -> str:
+    """
+    Apply scheme adjustment to predicted order quantity ensuring whole number results.
+    
+    Rule: If predicted order quantity is within ±tolerance of a scheme total,
+    adjust to that scheme format. The scheme result must always sum to a whole number.
+    
+    Args:
+        predicted_order_qty: Quantity after box adjustment
+        row: Current row data
+        df: Full DataFrame for context
+        tolerance: Tolerance for scheme adjustments (±tolerance)
+    
+    Returns:
+        Formatted order string with scheme pattern (ensuring whole number sum)
+    """
+    # Check for Scm column
+    scm_col = None
+    for col in ['Scm', 'Scm.', 'scm', 'scm.']:
+        if col in df.columns:
+            scm_col = col
+            break
+    
+    if not scm_col or pd.isna(row[scm_col]):
+        # No scheme available, return as simple number
+        if predicted_order_qty == int(predicted_order_qty):
+            return str(int(predicted_order_qty))
+        else:
+            return f"{predicted_order_qty:.1f}"
+    
+    scm_value = str(row[scm_col]).strip()
+    
+    # Handle no scheme cases
+    if scm_value in ['0', '0+0', '', 'nan', 'null', 'none']:
+        if predicted_order_qty == int(predicted_order_qty):
+            return str(int(predicted_order_qty))
+        else:
+            return f"{predicted_order_qty:.1f}"
+    
+    # Parse scheme pattern (e.g., "5+1", "9+1")
+    if '+' not in scm_value:
+        # Not a scheme pattern, return as simple number
+        if predicted_order_qty == int(predicted_order_qty):
+            return str(int(predicted_order_qty))
+        else:
+            return f"{predicted_order_qty:.1f}"
+    
+    try:
+        scheme_parts = scm_value.split('+')
+        if len(scheme_parts) != 2:
+            raise ValueError("Invalid scheme format")
+        
+        scheme_base = float(scheme_parts[0])
+        scheme_bonus = float(scheme_parts[1])
+        
+        # If either part is 0, treat as no scheme
+        if scheme_base == 0 or scheme_bonus == 0:
+            if predicted_order_qty == int(predicted_order_qty):
+                return str(int(predicted_order_qty))
+            else:
+                return f"{predicted_order_qty:.1f}"
+        
+        # Calculate original scheme total
+        original_scheme_total = scheme_base + scheme_bonus
+        
+        # Check if predicted order quantity is within tolerance of the scheme total
+        difference = abs(predicted_order_qty - original_scheme_total)
+        
+        if difference <= tolerance:
+            # Use the original scheme
+            base_str = str(int(scheme_base)) if scheme_base == int(scheme_base) else f"{scheme_base:.1f}"
+            bonus_str = str(int(scheme_bonus)) if scheme_bonus == int(scheme_bonus) else f"{scheme_bonus:.1f}"
+            return f"{base_str}+{bonus_str}"
+        
+        # Try to find a proportional scheme that results in a whole number
+        # and is within tolerance of predicted_order_qty
+        
+        # Test different multipliers to find one that gives a whole number total
+        # and is close to predicted_order_qty
+        best_scheme = None
+        best_difference = float('inf')
+        
+        # Test multipliers from 0.1 to 5.0 in increments of 0.1
+        for multiplier in [i/10.0 for i in range(1, 51)]:
+            test_base = scheme_base * multiplier
+            test_bonus = scheme_bonus * multiplier
+            test_total = test_base + test_bonus
+            
+            # Check if total is a whole number (or very close to one)
+            if abs(test_total - round(test_total)) < 0.001:
+                test_total_rounded = round(test_total)
+                diff = abs(predicted_order_qty - test_total_rounded)
+                
+                if diff <= tolerance and diff < best_difference:
+                    best_difference = diff
+                    # Adjust base and bonus to ensure they sum to the whole number
+                    # Keep the original ratio but adjust to sum to whole number
+                    ratio = scheme_base / (scheme_base + scheme_bonus)
+                    adjusted_base = test_total_rounded * ratio
+                    adjusted_bonus = test_total_rounded * (1 - ratio)
+                    
+                    # Round to reasonable precision
+                    adjusted_base = round(adjusted_base * 2) / 2  # Round to nearest 0.5
+                    adjusted_bonus = round(adjusted_bonus * 2) / 2  # Round to nearest 0.5
+                    
+                    # Ensure they still sum to whole number
+                    if abs((adjusted_base + adjusted_bonus) - test_total_rounded) > 0.1:
+                        # Adjust bonus to make sum exact
+                        adjusted_bonus = test_total_rounded - adjusted_base
+                    
+                    best_scheme = (adjusted_base, adjusted_bonus)
+        
+        if best_scheme:
+            base_val, bonus_val = best_scheme
+            base_str = str(int(base_val)) if base_val == int(base_val) else f"{base_val:.1f}"
+            bonus_str = str(int(bonus_val)) if bonus_val == int(bonus_val) else f"{bonus_val:.1f}"
+            return f"{base_str}+{bonus_str}"
+        
+        # If no suitable scheme found, return as simple number
+        if predicted_order_qty == int(predicted_order_qty):
+            return str(int(predicted_order_qty))
+        else:
+            return f"{predicted_order_qty:.1f}"
+        
+    except (ValueError, TypeError, IndexError):
+        # Fallback to simple number if scheme parsing fails
+        if predicted_order_qty == int(predicted_order_qty):
+            return str(int(predicted_order_qty))
+        else:
+            return f"{predicted_order_qty:.1f}"
+
+
+def _apply_scheme_adjustment(adjusted_qty: float, row: pd.Series, df: pd.DataFrame, tolerance: int) -> str:
+    """
+    Apply scheme adjustment to quantity with intelligent multiplier selection.
+    
+    Args:
+        adjusted_qty: Quantity after box adjustment
+        row: Current row data
+        df: Full DataFrame for context
+        tolerance: Tolerance for scheme adjustments (±tolerance)
+    
+    Returns:
+        Formatted order string with scheme pattern
+    """
+    # Check for Scm column
+    scm_col = None
+    for col in ['Scm', 'Scm.', 'scm', 'scm.']:
+        if col in df.columns:
+            scm_col = col
+            break
+    
+    if not scm_col or pd.isna(row[scm_col]):
+        # No scheme available, return as simple number
+        if adjusted_qty == int(adjusted_qty):
+            return str(int(adjusted_qty))
+        else:
+            return f"{adjusted_qty:.1f}"
+    
+    scm_value = str(row[scm_col]).strip()
+    
+    # Handle no scheme cases
+    if scm_value in ['0', '0+0', '', 'nan', 'null', 'none']:
+        if adjusted_qty == int(adjusted_qty):
+            return str(int(adjusted_qty))
+        else:
+            return f"{adjusted_qty:.1f}"
+    
+    # Parse scheme pattern (e.g., "5+1", "3+1")
+    if '+' not in scm_value:
+        # Not a scheme pattern, return as simple number
+        if adjusted_qty == int(adjusted_qty):
+            return str(int(adjusted_qty))
+        else:
+            return f"{adjusted_qty:.1f}"
+    
+    try:
+        scheme_parts = scm_value.split('+')
+        if len(scheme_parts) != 2:
+            raise ValueError("Invalid scheme format")
+        
+        scheme_base = float(scheme_parts[0])
+        scheme_bonus = float(scheme_parts[1])
+        
+        # If either part is 0, treat as no scheme
+        if scheme_base == 0 or scheme_bonus == 0:
+            if adjusted_qty == int(adjusted_qty):
+                return str(int(adjusted_qty))
+            else:
+                return f"{adjusted_qty:.1f}"
+        
+        # Find optimal scheme multiplier
+        total_scheme = scheme_base + scheme_bonus
+        
+        # For very small quantities, return as-is
+        if adjusted_qty <= 1:
+            if adjusted_qty == int(adjusted_qty):
+                return str(int(adjusted_qty))
+            else:
+                return f"{adjusted_qty:.1f}"
+        
+        # Test valid multipliers: 0.5x, 1x, 2x, 3x, 4x, 5x
+        valid_multipliers = [0.5, 1, 2, 3, 4, 5]
+        best_multiplier = 1
+        best_difference = float('inf')
+        
+        # Enhanced logic considering demand trends from memories
+        demand_trend_factor = _calculate_demand_trend_factor(row, df)
+        
+        for multiplier in valid_multipliers:
+            test_total = total_scheme * multiplier
+            difference = abs(adjusted_qty - test_total)
+            
+            # Apply trend-based scoring
+            if demand_trend_factor > 1.2 and test_total > adjusted_qty:
+                # Prefer higher quantities for increasing demand
+                adjusted_difference = difference * 0.7
+            elif demand_trend_factor < 0.8 and test_total < adjusted_qty:
+                # Prefer lower quantities for decreasing demand
+                adjusted_difference = difference * 0.7
+            else:
+                adjusted_difference = difference
+            
+            # Check if within tolerance
+            if adjusted_difference <= tolerance and adjusted_difference < best_difference:
+                best_difference = adjusted_difference
+                best_multiplier = multiplier
+        
+        # Apply the best multiplier
+        new_base = _round_to_half(scheme_base * best_multiplier)
+        new_bonus = _round_to_half(scheme_bonus * best_multiplier)
+        
+        # Format values
+        base_str = str(int(new_base)) if new_base == int(new_base) else f"{new_base:.1f}"
+        bonus_str = str(int(new_bonus)) if new_bonus == int(new_bonus) else f"{new_bonus:.1f}"
+        
+        return f"{base_str}+{bonus_str}"
+        
+    except (ValueError, TypeError, IndexError):
+        # Fallback to simple number if scheme parsing fails
+        if adjusted_qty == int(adjusted_qty):
+            return str(int(adjusted_qty))
+        else:
+            return f"{adjusted_qty:.1f}"
+
+
+def _calculate_demand_trend_factor(row: pd.Series, df: pd.DataFrame) -> float:
+    """
+    Calculate demand trend factor based on sales history.
+    
+    Args:
+        row: Current row data
+        df: Full DataFrame for context
+    
+    Returns:
+        Trend factor (>1.0 for increasing, <1.0 for decreasing, 1.0 for stable)
+    """
+    sales_cols = ['L7', 'L15', 'L30', 'L45', 'L60', 'L75', 'L90']
+    available_sales = [col for col in sales_cols if col in df.columns]
+    
+    if len(available_sales) < 3:
+        return 1.0  # Neutral if insufficient data
+    
+    # Get sales values
+    sales_values = []
+    for col in available_sales:
+        val = row.get(col, 0)
+        if pd.notna(val):
+            try:
+                sales_values.append(float(val))
+            except (ValueError, TypeError):
+                sales_values.append(0)
+        else:
+            sales_values.append(0)
+    
+    if len(sales_values) < 3:
+        return 1.0
+    
+    # Enhanced trend analysis from memory
+    recent_avg = sum(sales_values[:2]) / 2 if len(sales_values) >= 2 else sales_values[0]
+    older_avg = sum(sales_values[-2:]) / 2 if len(sales_values) >= 2 else sales_values[-1]
+    
+    # Check overall growth pattern
+    overall_growth = sales_values[0] / sales_values[-1] if sales_values[-1] > 0 else 1
+    
+    # Check for consistent growth
+    growth_consistency = 0
+    for i in range(len(sales_values) - 1):
+        if sales_values[i] > sales_values[i + 1]:
+            growth_consistency += 1
+    
+    consistency_ratio = growth_consistency / (len(sales_values) - 1) if len(sales_values) > 1 else 0
+    
+    if older_avg > 0:
+        trend_ratio = recent_avg / older_avg
+        
+        # Enhanced trend factor calculation based on memory
+        if trend_ratio < 0.7:  # Decreasing trend
+            return 0.8
+        elif trend_ratio > 2.0 and consistency_ratio > 0.6:  # Strong consistent growth
+            return 1.8  # Very aggressive for strong trends
+        elif trend_ratio > 1.5 and consistency_ratio > 0.5:  # Good growth
+            return 1.5  # More aggressive
+        elif trend_ratio > 1.3:  # Moderate growth
+            return 1.2  # Standard increase
+    
+    return 1.0  # Neutral
+
+
+def _round_to_half(value: float) -> float:
+    """
+    Round value to nearest 0.5.
+    
+    Args:
+        value: Value to round
+    
+    Returns:
+        Rounded value
+    """
+    return round(value * 2) / 2

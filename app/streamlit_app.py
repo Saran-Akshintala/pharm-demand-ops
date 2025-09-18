@@ -22,7 +22,8 @@ from utils import (
     parse_order_scheme,
     reconstruct_order_prediction,
     validate_input_data,
-    apply_predicted_order_business_rules
+    apply_predicted_order_business_rules,
+    compute_predicted_order_with_adjustments
 )
 
 # Load custom CSS (deprecated) - default Streamlit styling only
@@ -48,8 +49,8 @@ st.set_page_config(
 
 # Default Streamlit styling only (no CSS injection)
 
-def process_uploaded_file(uploaded_file):
-    """Process uploaded Excel file and return predictions"""
+def process_uploaded_file(uploaded_file, apply_box=True, box_tolerance=2, apply_scm=True, scm_tolerance=2):
+    """Process uploaded Excel file and return predictions with configurable adjustments"""
     try:
         # Read the uploaded file
         df = pd.read_excel(uploaded_file)
@@ -105,103 +106,14 @@ def process_uploaded_file(uploaded_file):
         df_result = df.copy()
         df_result['Predicted_Base_Quantity'] = predictions.round().astype(int)
         
-        # Reconstruct order predictions using Scm column for scheme-based predictions
-        predicted_orders = []
-        for i, row in df_result.iterrows():
-            base_qty = int(row['Predicted_Base_Quantity'])
-            
-            # Use Scm column to determine order format
-            predicted_order = str(base_qty)  # Default fallback
-            
-            # Check for Scm. column (note the period)
-            scm_col = None
-            for col in ['Scm', 'Scm.', 'scm', 'scm.']:
-                if col in df.columns:
-                    scm_col = col
-                    break
-            
-            if scm_col and pd.notna(row[scm_col]):
-                scm_value = str(row[scm_col]).strip()
-                
-                # Debug: Check what we're getting
-                print(f"Debug: Scm value = '{scm_value}', Base qty = {base_qty}")
-                
-                # Check for no scheme cases - use simple base quantity
-                if scm_value in ['0', '0+0', '', 'nan', 'null', 'none']:
-                    predicted_order = str(base_qty)
-                    print(f"Debug: No scheme case, order = {predicted_order}")
-                elif '+' in scm_value:
-                    # Parse scheme pattern (e.g., "2+1", "5+1")
-                    try:
-                        scheme_parts = scm_value.split('+')
-                        if len(scheme_parts) == 2:
-                            scheme_base = float(scheme_parts[0])
-                            scheme_bonus = float(scheme_parts[1])
-                            
-                            print(f"Debug: Scheme parts - base: {scheme_base}, bonus: {scheme_bonus}")
-                            
-                            # If either part is 0, treat as no scheme
-                            if scheme_base == 0 or scheme_bonus == 0:
-                                predicted_order = str(base_qty)
-                                print(f"Debug: Zero scheme detected, order = {predicted_order}")
-                            else:
-                                # Calculate proportional scheme: maintain the ratio
-                                total_scheme = scheme_base + scheme_bonus
-                                base_ratio = scheme_base / total_scheme
-                                bonus_ratio = scheme_bonus / total_scheme
-                                
-                                new_base = base_qty * base_ratio
-                                new_bonus = base_qty * bonus_ratio
-                                
-                                print(f"Debug: Calculated - new_base: {new_base}, new_bonus: {new_bonus}")
-                                
-                                # Round to nearest 0.5 for fractional values
-                                def round_to_half(value):
-                                    return round(value * 2) / 2
-                                
-                                new_base_rounded = round_to_half(new_base)
-                                new_bonus_rounded = round_to_half(new_bonus)
-                                
-                                print(f"Debug: Rounded - new_base: {new_base_rounded}, new_bonus: {new_bonus_rounded}")
-                                
-                                # Format as integer if whole numbers, otherwise as decimal
-                                if new_base_rounded == int(new_base_rounded) and new_bonus_rounded == int(new_bonus_rounded):
-                                    predicted_order = f"{int(new_base_rounded)}+{int(new_bonus_rounded)}"
-                                else:
-                                    predicted_order = f"{new_base_rounded:.1f}+{new_bonus_rounded:.1f}"
-                                
-                                print(f"Debug: Final scheme order = {predicted_order}")
-                        else:
-                            predicted_order = str(base_qty)
-                    except Exception as e:
-                        print(f"Debug: Exception in scheme parsing: {e}")
-                        predicted_order = str(base_qty)
-                else:
-                    # Single number or other format
-                    predicted_order = str(base_qty)
-                    print(f"Debug: Single number case, order = {predicted_order}")
-            else:
-                # No Scm column - fallback to original logic
-                print(f"Debug: No Scm column, using fallback")
-                order_col = None
-                for col in df.columns:
-                    col_lower = col.lower()
-                    if col_lower in ['order', 'ord', 'oreder']:
-                        order_col = col
-                        break
-                
-                if order_col and pd.notna(row[order_col]):
-                    try:
-                        _, scheme_info = parse_order_scheme(str(row[order_col]))
-                        predicted_order = reconstruct_order_prediction(base_qty, scheme_info)
-                    except:
-                        predicted_order = str(base_qty)
-                else:
-                    predicted_order = str(base_qty)
-            
-            predicted_orders.append(predicted_order)
-        
-        df_result['Predicted_Order'] = predicted_orders
+        # Use new deterministic logic to compute Predicted_Order from Predicted_Base_Quantity
+        df_result = compute_predicted_order_with_adjustments(
+            df_result, 
+            apply_box=apply_box, 
+            box_tolerance=box_tolerance,
+            apply_scm=apply_scm, 
+            scm_tolerance=scm_tolerance
+        )
         
         # Apply business rules to Predicted_Order column
         df_result, styling_info = apply_predicted_order_business_rules(df_result)
@@ -375,6 +287,95 @@ def main():
             
             # Preview table with business rule styling
             st.markdown("## 📋 Detailed Results (All Rows)")
+            
+            # Add UI controls for box and scheme adjustments
+            st.markdown("### ⚙️ Order Adjustment Settings")
+            
+            # Add explanation of priority rules
+            with st.expander("📝 Priority Rules Explanation", expanded=False):
+                st.markdown("""
+                **Predicted_Order Computation Priority:**
+                
+                1. **Stock Subtraction**: `Predicted_Order = Predicted_Base_Quantity - Stock`
+                2. **Box Adjustment**: If result is within ±tolerance of Box quantity, adjust to Box quantity
+                3. **Scheme Adjustment**: If result is within ±tolerance of scheme total, apply scheme format
+                
+                **Examples:**
+                - Base=14, Stock=4 → 14-4=10
+                - If Box=10 and tolerance=2: 10 is exactly Box, so stays 10
+                - If Scm=5+1 (total=6) and tolerance=2: |10-6|=4 > 2, so stays 10
+                
+                **Note**: Scheme results always sum to whole numbers (e.g., 4.5+0.5=5, not 4+0.5=4.5)
+                """)
+            
+            # Create columns for compact layout
+            col1, col2, col3, col4, col5 = st.columns([2, 1, 2, 1, 1])
+            
+            with col1:
+                apply_box_adj = st.checkbox("Apply Box Quantity", value=True, key="apply_box_checkbox")
+            
+            with col2:
+                box_tolerance_val = st.number_input("Box tolerance", min_value=0, max_value=10, value=2, step=1, key="box_tolerance_input")
+            
+            with col3:
+                apply_scm_adj = st.checkbox("Apply Scm", value=True, key="apply_scm_checkbox")
+            
+            with col4:
+                scm_tolerance_val = st.number_input("Scm tolerance", min_value=0, max_value=10, value=2, step=1, key="scm_tolerance_input")
+            
+            with col5:
+                generate_button = st.button("Generate", type="primary", key="generate_button", help="Regenerate Predicted_Order with current settings")
+            
+            # Initialize session state for settings
+            if 'current_settings' not in st.session_state:
+                st.session_state.current_settings = {
+                    'apply_box': True,
+                    'box_tolerance': 2,
+                    'apply_scm': True,
+                    'scm_tolerance': 2
+                }
+            
+            # Check if settings changed or Generate button clicked
+            settings_changed = (
+                st.session_state.current_settings['apply_box'] != apply_box_adj or
+                st.session_state.current_settings['box_tolerance'] != box_tolerance_val or
+                st.session_state.current_settings['apply_scm'] != apply_scm_adj or
+                st.session_state.current_settings['scm_tolerance'] != scm_tolerance_val
+            )
+            
+            # Regenerate if Generate button clicked or if this is initial load
+            if generate_button or settings_changed or 'df_result_adjusted' not in st.session_state:
+                # Update current settings
+                st.session_state.current_settings = {
+                    'apply_box': apply_box_adj,
+                    'box_tolerance': box_tolerance_val,
+                    'apply_scm': apply_scm_adj,
+                    'scm_tolerance': scm_tolerance_val
+                }
+                
+                # Reprocess with new settings
+                with st.spinner("🔄 Regenerating predictions with new settings..."):
+                    result_adjusted = process_uploaded_file(
+                        uploaded_file, 
+                        apply_box=apply_box_adj, 
+                        box_tolerance=box_tolerance_val,
+                        apply_scm=apply_scm_adj, 
+                        scm_tolerance=scm_tolerance_val
+                    )
+                    if result_adjusted[0] is not None:
+                        st.session_state.df_result_adjusted, st.session_state.df_processed_adjusted, st.session_state.styling_info_adjusted = result_adjusted
+                        st.success("✅ Predictions regenerated successfully!")
+                    else:
+                        st.error("❌ Error regenerating predictions")
+                        st.session_state.df_result_adjusted, st.session_state.df_processed_adjusted, st.session_state.styling_info_adjusted = None, None, None
+            
+            # Use adjusted results if available, otherwise fall back to original
+            if 'df_result_adjusted' in st.session_state and st.session_state.df_result_adjusted is not None:
+                df_result = st.session_state.df_result_adjusted
+                df_processed = st.session_state.df_processed_adjusted
+                styling_info = st.session_state.styling_info_adjusted
+            
+            st.markdown("---")  # Add separator line
             
             # Apply styling based on business rules
             def apply_business_rule_styling(df, styling_info):
