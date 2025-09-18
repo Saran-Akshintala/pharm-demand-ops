@@ -25,6 +25,7 @@ from utils import (
     apply_predicted_order_business_rules,
     compute_predicted_order_with_adjustments
 )
+from retrain import ModelRetrainer, ModelRegistry
 
 # Load custom CSS (deprecated) - default Streamlit styling only
 def load_css():
@@ -118,6 +119,10 @@ def process_uploaded_file(uploaded_file, apply_box=True, box_tolerance=2, apply_
         # Apply business rules to Predicted_Order column
         df_result, styling_info = apply_predicted_order_business_rules(df_result)
         
+        # Apply expiry highlighting
+        from utils import apply_expiry_highlighting
+        expiry_styling = apply_expiry_highlighting(df_result)
+        
         # Reorder columns to place predictions next to Order column (fix from memory)
         order_col = None
         # Check for various order column name variations
@@ -144,11 +149,11 @@ def process_uploaded_file(uploaded_file, apply_box=True, box_tolerance=2, apply_
             # Reorder the dataframe
             df_result = df_result.reindex(columns=cols)
         
-        return df_result, df_processed, styling_info
+        return df_result, df_processed, styling_info, expiry_styling
         
     except Exception as e:
         st.error(f"❌ Error processing file: {str(e)}")
-        return None, None, None
+        return None, None, None, None
 
 def create_visualizations(df_result, df_processed):
     """Create visualizations for the predictions"""
@@ -201,6 +206,19 @@ def main():
     # Add section divider
     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
     
+    # Create tabs for different functionalities
+    tab1, tab2 = st.tabs(["📊 Demand Prediction", "🔄 Model Retraining"])
+    
+    with tab1:
+        prediction_tab()
+    
+    with tab2:
+        retraining_tab()
+
+
+def prediction_tab():
+    """Original prediction functionality in a tab"""
+    
     # Sidebar with model information
     with st.sidebar:
         st.markdown("## 🤖 Model Information")
@@ -252,9 +270,9 @@ def main():
         with st.spinner("🔄 Processing your data..."):
             result = process_uploaded_file(uploaded_file)
             if result[0] is not None:
-                df_result, df_processed, styling_info = result
+                df_result, df_processed, styling_info, expiry_styling = result
             else:
-                df_result, df_processed, styling_info = None, None, None
+                df_result, df_processed, styling_info, expiry_styling = None, None, None, None
         
         if df_result is not None:
             st.success("✅ Predictions generated successfully!")
@@ -363,22 +381,23 @@ def main():
                         scm_tolerance=scm_tolerance_val
                     )
                     if result_adjusted[0] is not None:
-                        st.session_state.df_result_adjusted, st.session_state.df_processed_adjusted, st.session_state.styling_info_adjusted = result_adjusted
+                        st.session_state.df_result_adjusted, st.session_state.df_processed_adjusted, st.session_state.styling_info_adjusted, st.session_state.expiry_styling_adjusted = result_adjusted
                         st.success("✅ Predictions regenerated successfully!")
                     else:
                         st.error("❌ Error regenerating predictions")
-                        st.session_state.df_result_adjusted, st.session_state.df_processed_adjusted, st.session_state.styling_info_adjusted = None, None, None
+                        st.session_state.df_result_adjusted, st.session_state.df_processed_adjusted, st.session_state.styling_info_adjusted, st.session_state.expiry_styling_adjusted = None, None, None, None
             
             # Use adjusted results if available, otherwise fall back to original
             if 'df_result_adjusted' in st.session_state and st.session_state.df_result_adjusted is not None:
                 df_result = st.session_state.df_result_adjusted
                 df_processed = st.session_state.df_processed_adjusted
                 styling_info = st.session_state.styling_info_adjusted
+                expiry_styling = st.session_state.expiry_styling_adjusted
             
             st.markdown("---")  # Add separator line
             
             # Apply styling based on business rules
-            def apply_business_rule_styling(df, styling_info):
+            def apply_business_rule_styling(df, styling_info, expiry_styling=None):
                 styler = df.style
                 
                 # Apply business rule colors to Predicted_Order column
@@ -390,6 +409,31 @@ def main():
                                 styler = styler.set_properties(
                                     subset=pd.IndexSlice[row_idx, 'Predicted_Order'],
                                     **{"background-color": style_info['color'], "color": "black"}
+                                )
+                
+                # Apply expiry column highlighting
+                if expiry_styling:
+                    # Find expiry column
+                    expiry_col = None
+                    expiry_col_variations = ['Expiry', 'Expiry Date', 'Exp', 'Exp Date', 'expiry', 'expiry_date']
+                    
+                    for col_name in expiry_col_variations:
+                        if col_name in df.columns:
+                            expiry_col = col_name
+                            break
+                    
+                    if expiry_col is None:
+                        for col in df.columns:
+                            if 'expiry' in str(col).lower() or 'exp' in str(col).lower():
+                                expiry_col = col
+                                break
+                    
+                    if expiry_col:
+                        for row_idx, expiry_style in expiry_styling.items():
+                            if row_idx < len(df):
+                                styler = styler.set_properties(
+                                    subset=pd.IndexSlice[row_idx, expiry_col],
+                                    **{"background-color": expiry_style['color'], "color": "black"}
                                 )
                 
                 # Highlight key columns with light background
@@ -409,21 +453,34 @@ def main():
                 return styler
             
             if styling_info:
-                styled_df = apply_business_rule_styling(df_result, styling_info)
+                styled_df = apply_business_rule_styling(df_result, styling_info, expiry_styling)
                 st.dataframe(styled_df, use_container_width=True)
                 
                 # Display tooltip information as expandable section
                 with st.expander("📝 View Highlighting Reasons", expanded=False):
                     st.markdown("**Rows with business rule highlighting:**")
                     tooltip_data = []
-                    for row_idx, style_info in styling_info.items():
+                    
+                    # Combine Predicted_Order and Expiry tooltips
+                    all_highlighted_rows = set(styling_info.keys())
+                    if expiry_styling:
+                        all_highlighted_rows.update(expiry_styling.keys())
+                    
+                    for row_idx in sorted(all_highlighted_rows):
                         if row_idx < len(df_result):
                             product_name = df_result.iloc[row_idx].get('Name', f'Row {row_idx + 1}')
                             predicted_order = df_result.iloc[row_idx].get('Predicted_Order', 'N/A')
+                            
+                            reasons = []
+                            if row_idx in styling_info:
+                                reasons.append(f"Predicted_Order: {styling_info[row_idx]['tooltip']}")
+                            if expiry_styling and row_idx in expiry_styling:
+                                reasons.append(f"Expiry: {expiry_styling[row_idx]['tooltip']}")
+                            
                             tooltip_data.append({
                                 'Product': str(product_name)[:50] + '...' if len(str(product_name)) > 50 else str(product_name),
                                 'Predicted_Order': predicted_order,
-                                'Reason': style_info['tooltip']
+                                'Reason': ' | '.join(reasons)
                             })
                     
                     if tooltip_data:
@@ -434,6 +491,7 @@ def main():
                 
                 # Add legend for colors
                 st.markdown("### 🎨 Color Legend")
+                st.markdown("**Predicted_Order Column:**")
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     st.markdown('<div style="background-color: #ffcccc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🔴 Reddish: Days > 90 / Uneven Sales</div>', unsafe_allow_html=True)
@@ -443,6 +501,15 @@ def main():
                     st.markdown('<div style="background-color: #ffe6cc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟠 Orangish: Box Adjustment ±2</div>', unsafe_allow_html=True)
                 with col4:
                     st.markdown('<div style="background-color: #ffffcc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟡 Yellowish: Low Customers ≤2</div>', unsafe_allow_html=True)
+                
+                st.markdown("**Expiry Column:**")
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.markdown('<div style="background-color: #ffcccc; padding: 5px; border-radius: 3px; text-align: center; color: black;">⚠️ URGENT: Expiring ≤ 1 month</div>', unsafe_allow_html=True)
+                with col2:
+                    st.markdown('<div style="background-color: #ffe6cc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟠 Soon: Expiring ≤ 3 months</div>', unsafe_allow_html=True)
+                with col3:
+                    st.markdown('<div style="background-color: #fff2cc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟡 Moderate: Expiring ≤ 5 months</div>', unsafe_allow_html=True)
             else:
                 st.dataframe(df_result, use_container_width=True)
 
@@ -455,7 +522,7 @@ def main():
                 df_result.to_excel(writer, index=False, sheet_name='Predictions')
                 
                 # Apply styling to Excel file
-                if styling_info:
+                if styling_info or expiry_styling:
                     from openpyxl.styles import PatternFill
                     from openpyxl.comments import Comment
                     
@@ -468,8 +535,16 @@ def main():
                             predicted_order_col = col_idx
                             break
                     
-                    if predicted_order_col:
-                        # Apply colors and comments
+                    # Find Expiry column
+                    expiry_col = None
+                    expiry_col_variations = ['Expiry', 'Expiry Date', 'Exp', 'Exp Date', 'expiry', 'expiry_date']
+                    for col_idx, col_name in enumerate(df_result.columns, 1):
+                        if col_name in expiry_col_variations or 'expiry' in str(col_name).lower():
+                            expiry_col = col_idx
+                            break
+                    
+                    # Apply Predicted_Order styling
+                    if styling_info and predicted_order_col:
                         for row_idx, style_info in styling_info.items():
                             excel_row = row_idx + 2  # +2 because Excel is 1-indexed and has header
                             cell = worksheet.cell(row=excel_row, column=predicted_order_col)
@@ -482,6 +557,21 @@ def main():
                             
                             # Always add comment with tooltip (including "No Order" explanations)
                             comment = Comment(style_info['tooltip'], 'Business Rules')
+                            cell.comment = comment
+                    
+                    # Apply Expiry column styling
+                    if expiry_styling and expiry_col:
+                        for row_idx, expiry_style in expiry_styling.items():
+                            excel_row = row_idx + 2  # +2 because Excel is 1-indexed and has header
+                            cell = worksheet.cell(row=excel_row, column=expiry_col)
+                            
+                            # Apply background color
+                            color_hex = expiry_style['color'].replace('#', '')
+                            fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
+                            cell.fill = fill
+                            
+                            # Add comment with expiry tooltip
+                            comment = Comment(expiry_style['tooltip'], 'Expiry Alert')
                             cell.comment = comment
             
             excel_data = output.getvalue()
@@ -501,6 +591,229 @@ def main():
         <p>📊 Enhanced with XGBoost, Random Forest & Feature Engineering</p>
     </div>
     """, unsafe_allow_html=True)
+
+
+def retraining_tab():
+    """Model Retraining & Management functionality"""
+    st.markdown("## 🔄 Model Retraining & Management")
+    st.markdown("Upload modified Excel files to retrain the prediction model and manage model versions.")
+    
+    # Initialize model retrainer with correct path
+    script_dir = Path(__file__).parent.absolute()
+    models_dir = script_dir.parent / "models"
+    retrainer = ModelRetrainer(str(models_dir))
+    registry = ModelRegistry(str(models_dir))
+    
+    # Create columns for layout
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.markdown("### 📎 Upload Training Data")
+        
+        # File uploader for multiple files
+        uploaded_files = st.file_uploader(
+            "Choose Excel files with modified Predicted_Order values",
+            type=['xlsx', 'xls'],
+            accept_multiple_files=True,
+            help="Upload Excel files containing your corrected Predicted_Order values for retraining"
+        )
+        
+        # Training options
+        st.markdown("### ⚙️ Training Options")
+        incremental_training = st.checkbox(
+            "Incremental Training", 
+            value=True, 
+            help="Build upon the existing model (recommended for XGBoost)"
+        )
+        
+        # Retrain button
+        if st.button("🚀 Start Retraining", type="primary", disabled=not uploaded_files):
+            if uploaded_files:
+                with st.spinner("🔄 Retraining model... This may take a few minutes."):
+                    result = retrainer.retrain_pipeline(uploaded_files, incremental=incremental_training)
+                
+                if result['success']:
+                    st.session_state['retraining_result'] = result
+                    st.success("✅ Model retraining completed successfully!")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Retraining failed: {result['error']}")
+    
+    with col2:
+        st.markdown("### 📊 Current Model Status")
+        
+        # Display current active model info
+        active_model = registry.get_active_model()
+        if active_model:
+            st.info(f"🏆 **Active Model:** {active_model['version']}")
+            st.write(f"📅 **Trained:** {active_model['timestamp'][:10]}")
+            
+            if 'metrics' in active_model:
+                metrics = active_model['metrics']
+                st.write("📊 **Performance:**")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.metric("RMSE", f"{metrics.get('rmse', 0):.3f}")
+                    st.metric("R²", f"{metrics.get('r2', 0):.3f}")
+                with col_b:
+                    st.metric("Accuracy", f"{metrics.get('accuracy', 0):.3f}")
+                    st.metric("F1 Score", f"{metrics.get('f1_score', 0):.3f}")
+        else:
+            st.warning("⚠️ No active model found")
+    
+    # Display retraining results if available
+    if 'retraining_result' in st.session_state:
+        result = st.session_state['retraining_result']
+        
+        st.markdown("---")
+        st.markdown("### 🔍 Model Comparison")
+        
+        if result.get('comparison'):
+            comparison = result['comparison']
+            
+            # Create comparison table
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.markdown("#### 📋 Current Model")
+                current_metrics = comparison['current']
+                for metric, value in current_metrics.items():
+                    st.metric(metric.upper(), f"{value:.4f}")
+            
+            with col2:
+                st.markdown("#### 🆕 New Model")
+                new_metrics = comparison['new']
+                for metric, value in new_metrics.items():
+                    improvement = comparison['improvements'].get(metric, 0)
+                    delta = f"{improvement:+.2f}%" if improvement != 0 else None
+                    st.metric(metric.upper(), f"{value:.4f}", delta=delta)
+            
+            with col3:
+                st.markdown("#### 🤖 Recommendation")
+                recommendation = comparison['recommendation']
+                if recommendation == 'use_new':
+                    st.success("✅ **Use New Model**\n\nThe new model shows significant improvements.")
+                else:
+                    st.info("🔄 **Keep Current**\n\nCurrent model performs adequately.")
+        
+        # Model confirmation buttons
+        st.markdown("### 📝 Finalize Model")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("✅ Accept New Model", type="primary"):
+                with st.spinner("Finalizing new model..."):
+                    final_version = retrainer.finalize_model(
+                        result['temp_version'],
+                        result['new_model_path'],
+                        result['new_metrics']
+                    )
+                    st.success(f"✅ New model {final_version} is now active!")
+                    del st.session_state['retraining_result']
+                    st.rerun()
+        
+        with col2:
+            if st.button("❌ Reject New Model"):
+                # Clean up temporary model
+                import os
+                if os.path.exists(result['new_model_path']):
+                    os.remove(result['new_model_path'])
+                st.info("🗑️ New model rejected and cleaned up.")
+                del st.session_state['retraining_result']
+                st.rerun()
+    
+    # Model version management
+    st.markdown("---")
+    st.markdown("### 📚 Model Version Management")
+    
+    all_models = registry.get_all_models()
+    if all_models:
+        st.markdown("#### 📋 Available Model Versions")
+        
+        # Create a table of all models
+        model_data = []
+        for version, info in all_models.items():
+            model_data.append({
+                'Version': version,
+                'Status': '🏆 Active' if info['is_active'] else '💾 Inactive',
+                'Trained': info['timestamp'][:10],
+                'RMSE': f"{info['metrics'].get('rmse', 0):.4f}" if 'metrics' in info else 'N/A',
+                'R²': f"{info['metrics'].get('r2', 0):.4f}" if 'metrics' in info else 'N/A',
+                'Accuracy': f"{info['metrics'].get('accuracy', 0):.4f}" if 'metrics' in info else 'N/A'
+            })
+        
+        model_df = pd.DataFrame(model_data)
+        st.dataframe(model_df, use_container_width=True, hide_index=True)
+        
+        # Rollback functionality
+        st.markdown("#### ⏪ Rollback to Previous Version")
+        
+        inactive_models = {v: info for v, info in all_models.items() if not info['is_active']}
+        if inactive_models:
+            selected_version = st.selectbox(
+                "Select version to rollback to:",
+                options=list(inactive_models.keys()),
+                format_func=lambda x: f"{x} (Trained: {inactive_models[x]['timestamp'][:10]})",
+                help="Select a previous model version to make it active"
+            )
+            
+            if selected_version:
+                col1, col2 = st.columns([1, 3])
+                with col1:
+                    if st.button("⏪ Rollback", type="secondary"):
+                        with st.spinner(f"Rolling back to {selected_version}..."):
+                            success = retrainer.rollback_to_version(selected_version)
+                            if success:
+                                st.success(f"✅ Successfully rolled back to {selected_version}!")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Rollback to {selected_version} failed.")
+                
+                with col2:
+                    if selected_version in inactive_models:
+                        selected_info = inactive_models[selected_version]
+                        if 'metrics' in selected_info:
+                            st.write(f"📊 **{selected_version} Metrics:**")
+                            metrics = selected_info['metrics']
+                            metric_cols = st.columns(4)
+                            with metric_cols[0]:
+                                st.metric("RMSE", f"{metrics.get('rmse', 0):.4f}")
+                            with metric_cols[1]:
+                                st.metric("R²", f"{metrics.get('r2', 0):.4f}")
+                            with metric_cols[2]:
+                                st.metric("Accuracy", f"{metrics.get('accuracy', 0):.4f}")
+                            with metric_cols[3]:
+                                st.metric("F1", f"{metrics.get('f1_score', 0):.4f}")
+        else:
+            st.info("📚 Only one model version available. Train more models to enable rollback.")
+    else:
+        st.info("📚 No model versions found. Upload training data to create your first model.")
+    
+    # Help section
+    with st.expander("📝 Help & Instructions", expanded=False):
+        st.markdown("""
+        **How to use Model Retraining:**
+        
+        1. **Upload Training Data**: Select Excel files containing corrected `Predicted_Order` values
+        2. **Choose Training Type**: 
+           - ✅ **Incremental**: Builds upon existing model (recommended)
+           - ❌ **Full Retrain**: Trains completely new model
+        3. **Review Comparison**: Compare new model metrics with current model
+        4. **Accept or Reject**: Choose whether to use the new model
+        5. **Rollback if Needed**: Switch back to previous versions anytime
+        
+        **Model Metrics Explained:**
+        - **RMSE**: Root Mean Squared Error (lower is better)
+        - **R²**: Coefficient of determination (higher is better, max 1.0)
+        - **Accuracy**: Classification accuracy (higher is better)
+        - **F1 Score**: Harmonic mean of precision and recall (higher is better)
+        
+        **Tips:**
+        - Upload multiple files for better training data diversity
+        - Incremental training preserves existing model knowledge
+        - Keep track of model versions for easy rollback
+        - Monitor metrics to ensure model improvements
+        """)
 
 if __name__ == "__main__":
     main()

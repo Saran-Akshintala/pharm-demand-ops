@@ -1,0 +1,21 @@
+{
+  "models": {
+    "v1": {
+      "version": "v1",
+      "path": "C:\\01-Git-Repos\\pharm-demand-ops\\models\\order_predictor.pkl",
+      "timestamp": "2025-09-18T21:52:55.944671",
+      "metrics": {
+        "rmse": 4.937289186000423,
+        "mae": 2.212464812318869,
+        "r2": 0.7990099971066016,
+        "accuracy": 0.85,
+        "precision": 0.8,
+        "recall": 0.82,
+        "f1_score": 0.81
+      },
+      "is_active": true
+    }
+  },
+  "active_model": "v1",
+  "next_version": 2
+}

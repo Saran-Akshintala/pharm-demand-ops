@@ -660,14 +660,21 @@ def apply_predicted_order_business_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame
                     'tooltip': f'Days since last purchase > 90 ({days_since_purchase})'
                 }
         
-        # Apply priority-based conflict resolution
+        # ENHANCED: Support multiple tooltip messages
         selected_condition = None
+        all_tooltips = []
         
         # Special handling for "No Order" - always store tooltip but no color
         if 'no_order' in conditions:
             selected_condition = conditions['no_order']
         else:
-            # Normal priority-based resolution for other conditions
+            # Collect all applicable tooltips
+            for priority_key in PRIORITY_ORDER:
+                if priority_key in conditions:
+                    condition = conditions[priority_key]
+                    all_tooltips.append(condition['tooltip'])
+            
+            # Normal priority-based resolution for color (highest priority wins)
             for priority_key in PRIORITY_ORDER:
                 if priority_key in conditions:
                     condition = conditions[priority_key]
@@ -679,15 +686,102 @@ def apply_predicted_order_business_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame
         # Update the dataframe with final values
         df_result.at[idx, 'Predicted_Order'] = display_value
         
-        # Store styling information (including "No Order" tooltips)
-        if selected_condition:
+        # Store styling information with multiple tooltips support
+        if selected_condition or all_tooltips:
+            # Combine all tooltips with line breaks
+            combined_tooltip = selected_condition['tooltip'] if selected_condition else ''
+            if all_tooltips and len(all_tooltips) > 1:
+                combined_tooltip = ' | '.join(all_tooltips)
+            elif all_tooltips and not combined_tooltip:
+                combined_tooltip = all_tooltips[0]
+            
             styling_info[idx] = {
-                'color': selected_condition['color'],
-                'tooltip': selected_condition['tooltip'],
+                'color': selected_condition['color'] if selected_condition else None,
+                'tooltip': combined_tooltip,
                 'display_value': display_value
             }
     
     return df_result, styling_info
+
+
+def apply_expiry_highlighting(df: pd.DataFrame) -> Dict[int, Dict[str, Any]]:
+    """
+    Apply highlighting to Expiry column for medicines expiring in ≤ 5 months.
+    
+    Args:
+        df: DataFrame with Expiry column
+    
+    Returns:
+        Dict with styling info for Expiry column: {row_index: {'color': str, 'tooltip': str}}
+    """
+    expiry_styling = {}
+    
+    # Find Expiry column (try different variations)
+    expiry_col = None
+    expiry_col_variations = ['Expiry', 'Expiry Date', 'Exp', 'Exp Date', 'expiry', 'expiry_date']
+    
+    for col_name in expiry_col_variations:
+        if col_name in df.columns:
+            expiry_col = col_name
+            break
+    
+    if expiry_col is None:
+        # Try case-insensitive search
+        for col in df.columns:
+            if 'expiry' in str(col).lower() or 'exp' in str(col).lower():
+                expiry_col = col
+                break
+    
+    if expiry_col is None:
+        return expiry_styling  # No expiry column found
+    
+    from datetime import datetime, timedelta
+    import dateutil.parser
+    
+    current_date = datetime.now()
+    five_months_ahead = current_date + timedelta(days=150)  # Approximately 5 months
+    
+    for idx, row in df.iterrows():
+        expiry_value = row.get(expiry_col)
+        
+        if pd.isna(expiry_value) or expiry_value is None:
+            continue
+        
+        try:
+            # Try to parse the expiry date
+            if isinstance(expiry_value, str):
+                expiry_date = dateutil.parser.parse(expiry_value)
+            elif hasattr(expiry_value, 'date'):
+                expiry_date = expiry_value
+            else:
+                continue
+            
+            # Calculate months until expiry
+            days_until_expiry = (expiry_date - current_date).days
+            months_until_expiry = days_until_expiry / 30.44  # Average days per month
+            
+            if months_until_expiry <= 5:
+                # Determine color based on urgency
+                if months_until_expiry <= 1:
+                    color = '#ffcccc'  # Light red for very urgent
+                    urgency = 'URGENT'
+                elif months_until_expiry <= 3:
+                    color = '#ffe6cc'  # Light orange for urgent
+                    urgency = 'Soon'
+                else:
+                    color = '#fff2cc'  # Light yellow for moderate
+                    urgency = 'Moderate'
+                
+                expiry_styling[idx] = {
+                    'color': color,
+                    'tooltip': f'{urgency}: Expiring in {months_until_expiry:.1f} months ({expiry_date.strftime("%Y-%m-%d")})'
+                }
+        
+        except (ValueError, TypeError, AttributeError):
+            # Skip rows with invalid date formats
+            continue
+    
+    return expiry_styling
 
 
 def apply_scheme_to_quantity(final_quantity: float, row: pd.Series, df: pd.DataFrame) -> str:
@@ -962,8 +1056,9 @@ def _apply_box_adjustment_new(predicted_order_qty: float, row: pd.Series, tolera
     """
     Apply box quantity adjustment to predicted order quantity after stock subtraction.
     
-    Rule: If predicted order quantity is within ±tolerance of box quantity, 
-    adjust to box quantity to fit into box.
+    New Rules:
+    1. If Box quantity is 0 or 1, ignore box adjustment logic
+    2. Otherwise, round to nearest box multiple (up or down)
     
     Args:
         predicted_order_qty: Quantity after stock subtraction
@@ -986,14 +1081,27 @@ def _apply_box_adjustment_new(predicted_order_qty: float, row: pd.Series, tolera
     except (ValueError, TypeError):
         return predicted_order_qty
     
-    # Check if predicted order quantity is within tolerance of box quantity
-    difference = abs(predicted_order_qty - box_qty)
+    # NEW RULE: If Box quantity is 0 or 1, ignore box adjustment
+    if box_qty <= 1:
+        return predicted_order_qty
     
+    # NEW RULE: Round to nearest box multiple
+    # Find the nearest multiple of box_qty
+    if predicted_order_qty <= 0:
+        return predicted_order_qty
+    
+    # Calculate nearest box multiple
+    multiple = round(predicted_order_qty / box_qty)
+    if multiple == 0:
+        multiple = 1  # At least one box if we're ordering
+    
+    nearest_box_qty = multiple * box_qty
+    
+    # Check if within tolerance
+    difference = abs(predicted_order_qty - nearest_box_qty)
     if difference <= tolerance:
-        # Adjust to box quantity
-        return box_qty
+        return nearest_box_qty
     else:
-        # Keep original quantity if not within tolerance
         return predicted_order_qty
 
 
@@ -1128,6 +1236,28 @@ def _apply_scheme_adjustment_new(predicted_order_qty: float, row: pd.Series, df:
         if best_scheme:
             base_val, bonus_val, used_multiplier = best_scheme
             
+            # EDGE CASE FIX: Ensure final sum is a whole number
+            total_sum = base_val + bonus_val
+            if total_sum != int(total_sum):
+                # Special handling for X+0.5 cases (e.g., 2+0.5, 3+0.5, 5+0.5)
+                if bonus_val == 0.5:
+                    # Increase the base by 0.5 to make sum whole
+                    # Examples: 2+0.5 → 2.5+0.5, 3+0.5 → 3.5+0.5, 5+0.5 → 5.5+0.5
+                    base_val += 0.5
+                elif base_val == 0.5:
+                    # If base is 0.5, increase bonus instead
+                    bonus_val += 0.5
+                else:
+                    # General case: round to nearest whole number and distribute
+                    target_sum = round(total_sum)
+                    diff = target_sum - total_sum
+                    
+                    # Add the difference to the larger component
+                    if base_val >= bonus_val:
+                        base_val += diff
+                    else:
+                        bonus_val += diff
+            
             # Format the values properly
             base_str = str(int(base_val)) if base_val == int(base_val) else f"{base_val:.1f}"
             bonus_str = str(int(bonus_val)) if bonus_val == int(bonus_val) else f"{bonus_val:.1f}"
@@ -1247,6 +1377,28 @@ def _apply_scheme_adjustment(adjusted_qty: float, row: pd.Series, df: pd.DataFra
         # Apply the best multiplier
         new_base = _round_to_half(scheme_base * best_multiplier)
         new_bonus = _round_to_half(scheme_bonus * best_multiplier)
+        
+        # EDGE CASE FIX: Ensure final sum is a whole number
+        total_sum = new_base + new_bonus
+        if total_sum != int(total_sum):
+            # Special handling for X+0.5 cases (e.g., 2+0.5, 3+0.5, 5+0.5)
+            if new_bonus == 0.5:
+                # Increase the base by 0.5 to make sum whole
+                # Examples: 2+0.5 → 2.5+0.5, 3+0.5 → 3.5+0.5, 5+0.5 → 5.5+0.5
+                new_base += 0.5
+            elif new_base == 0.5:
+                # If base is 0.5, increase bonus instead
+                new_bonus += 0.5
+            else:
+                # General case: round to nearest whole number and distribute
+                target_sum = round(total_sum)
+                diff = target_sum - total_sum
+                
+                # Add the difference to the larger component
+                if new_base >= new_bonus:
+                    new_base += diff
+                else:
+                    new_bonus += diff
         
         # Format values
         base_str = str(int(new_base)) if new_base == int(new_base) else f"{new_base:.1f}"
