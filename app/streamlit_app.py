@@ -856,19 +856,19 @@ def prediction_tab():
                 
                 return excel_data, filename
             
-            # Single button that generates Excel and provides download automatically
-            with st.spinner("Generating Excel file with styling..."):
-                excel_data, filename = generate_excel_with_styling()
-            
-            # Provide download button (always available after generation)
-            safe_download_button(
-                label="📅 Generate & Download Excel with Predictions",
-                data=excel_data,
-                file_name=filename,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                help="Click to download Excel file with all predictions, styling, and your edits. Server copy will be automatically saved."
-            )
+            # Single button that generates Excel and downloads only when clicked
+            if safe_button("📅 Generate & Download Excel with Predictions", type="primary", help="Click to generate and download Excel file with all predictions, styling, and your edits. Server copy will be automatically saved."):
+                with st.spinner("Generating Excel file with styling..."):
+                    excel_data, filename = generate_excel_with_styling()
+                    
+                    # Provide download
+                    safe_download_button(
+                        label="💾 Download Generated File",
+                        data=excel_data,
+                        file_name=filename,
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        help="Click to download the generated Excel file."
+                    )
     
     # Footer
     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
