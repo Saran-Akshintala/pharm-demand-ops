@@ -10,17 +10,22 @@ This project helps pharmacists predict optimal order quantities by analyzing his
 
 - **📊 Comprehensive EDA**: Analyze sales patterns, trends, and correlations
 - **🤖 ML Pipeline**: Train and evaluate multiple models (Linear Regression, Random Forest, XGBoost)
-- **🌐 Web Interface**: User-friendly Streamlit app for Excel upload/download
+- **🌐 Enhanced Web Interface**: Advanced Streamlit app with interactive grid features
+- **📱 Interactive Data Grid**: Professional st-aggrid integration with Excel preview
+- **🎨 Visual Feedback**: Color-coded business rules and change tracking
+- **🔍 Advanced Filtering**: Real-time filtering with "Ignore No Order" and supplier exclusion
+- **✏️ In-Grid Editing**: Direct editing of predicted values with persistence
 - **🔌 REST API**: FastAPI service for enterprise integration
 - **📈 Scheme Handling**: Parse and predict promotional schemes (e.g., "9+1", "12+2")
-- **📋 Excel Integration**: Direct Excel file processing and output
+- **📋 Excel Integration**: Direct Excel file processing and output with full styling
 
 ## 📂 Project Structure
 
 ```
 pharm-demand-ops/
 ├── app/                          # Application code
-│   ├── streamlit_app.py         # Streamlit web interface
+│   ├── streamlit_app.py         # Enhanced Streamlit web interface
+│   ├── enhanced_grid.py         # Advanced st-aggrid implementation
 │   ├── api.py                   # FastAPI REST service
 │   └── utils.py                 # Utility functions
 ├── notebooks/                    # Jupyter notebooks
@@ -109,12 +114,20 @@ API Documentation: http://localhost:8000/docs
 
 ## 📊 Usage Examples
 
-### Web Interface (Streamlit)
+### Enhanced Web Interface (Streamlit)
 
 1. **Upload Excel File**: Upload your pharmacy data with sales history
 2. **Review Data**: Check the uploaded data preview and validation warnings
-3. **Get Predictions**: Click to generate order predictions with confidence scores
-4. **Download Results**: Download Excel file with predicted order quantities
+3. **Interactive Grid**: View predictions in professional Excel-preview grid with:
+   - **Color-coded Business Rules**: Visual indicators for different scenarios
+   - **Interactive Tooltips**: Hover over cells for detailed explanations
+   - **In-Grid Editing**: Edit Predicted_Order values directly in the grid
+   - **Change Tracking**: Green highlighting shows your modifications
+4. **Advanced Filtering**: Use filters to focus on specific data:
+   - **"Ignore No Order"**: Hide rows with no predicted orders
+   - **Supplier Exclusion**: Filter out specific suppliers
+5. **Real-time Updates**: All changes and filters update immediately
+6. **One-Click Download**: Generate and download Excel with all styling and edits
 
 ### API Usage (FastAPI)
 
@@ -175,6 +188,49 @@ response = requests.get("http://localhost:8000/health")
 print(response.json())
 ```
 
+## 🚀 Enhanced Features
+
+### Interactive Data Grid (st-aggrid)
+
+The application features a professional, Excel-like data grid powered by st-aggrid:
+
+#### **Visual Features:**
+- **Color-coded Business Rules**: Automatic highlighting based on:
+  - 🔴 **Red**: Days > 90 or uneven sales patterns
+  - 🟠 **Orange**: Box quantity adjustments (±2)
+  - 🟡 **Yellow**: Low customer count (≤2)
+  - 🟢 **Green**: User-edited values
+  - **Expiry Colors**: Red (≤1 month), Orange (≤3 months), Yellow (≤5 months)
+
+#### **Interactive Features:**
+- **Hover Tooltips**: Detailed explanations for business rule decisions
+- **In-Grid Editing**: Direct editing of Predicted_Order values
+- **Change Tracking**: Visual indicators for modified cells
+- **Excel Preview**: True WYSIWYG experience
+
+#### **Advanced Filtering:**
+- **"Ignore No Order"**: Hide rows with no predicted orders
+- **Supplier Exclusion**: Multi-select dropdown to exclude specific suppliers
+- **Real-time Updates**: Immediate grid refresh on filter changes
+- **Persistent Edits**: Changes maintained across filter operations
+
+#### **Export Integration:**
+- **One-Click Download**: Single button for Excel generation and download
+- **Styled Export**: All colors, tooltips, and formatting preserved in Excel
+- **Filtered Export**: Only visible data included in download
+- **Automatic Server Backup**: Server copy saved automatically
+
+### Business Rule Engine
+
+Comprehensive business logic with visual feedback:
+
+1. **Box Quantity Adjustment**: Rounds to nearest box size with tolerance
+2. **Stock Subtraction**: Accounts for current inventory levels
+3. **Demand Trend Analysis**: Considers sales velocity and patterns
+4. **Expiry Management**: MM/YY format support with tiered warnings
+5. **Scheme Logic**: Intelligent promotional scheme handling
+6. **Customer Analysis**: Low customer count detection
+
 ## 🔧 Technical Details
 
 ### Machine Learning Pipeline
@@ -199,6 +255,56 @@ print(response.json())
    - Apply scheme logic based on quantity and patterns
    - Provide confidence scores
 
+### Enhanced Grid Architecture
+
+#### **st-aggrid Integration:**
+```python
+# Enhanced grid with professional features
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+
+# Configure grid with tooltips and styling
+gb = GridOptionsBuilder.from_dataframe(data)
+gb.configure_column(
+    "Predicted_Order",
+    editable=True,
+    tooltipField="Predicted_Order_Tooltip",
+    cellStyle=create_cell_style_js(styling_info)
+)
+
+# JavaScript-based cell styling
+def create_cell_style_js(styling_info):
+    return JsCode(f"""
+    function(params) {{
+        const colorMap = {styling_info};
+        if (colorMap[params.node.rowIndex]) {{
+            return {{
+                'background-color': colorMap[params.node.rowIndex],
+                'color': 'black',
+                'font-weight': 'bold'
+            }};
+        }}
+        return null;
+    }}
+    """)
+```
+
+#### **Product Key Mapping:**
+```python
+# Persistent edit tracking across filter operations
+def create_product_key(row):
+    return '|'.join([
+        str(row['Name']),
+        str(row['Supplier']),
+        str(row['Stock'])
+    ])
+
+# Apply changes back to full dataset
+for product_key, new_value in changes_map.items():
+    matching_rows = df[df.apply(lambda r: create_product_key(r) == product_key, axis=1)]
+    if not matching_rows.empty:
+        df.loc[matching_rows.index, 'Predicted_Order'] = new_value
+```
+
 ### API Endpoints
 
 - `GET /health` - Health check and model status
@@ -206,6 +312,36 @@ print(response.json())
 - `POST /predict/file` - Upload Excel/CSV for batch prediction
 - `GET /model/info` - Get model information and performance metrics
 - `GET /` - API information and available endpoints
+
+#### **Enhanced API Response Format:**
+```json
+{
+  "predictions": [
+    {
+      "product_code": "P001",
+      "product_name": "Medicine A",
+      "predicted_order": "12+2",
+      "predicted_base_quantity": 14,
+      "confidence_score": 0.87,
+      "business_rules": {
+        "box_adjustment": true,
+        "scheme_applied": "12+2",
+        "expiry_warning": "moderate",
+        "styling": {
+          "color": "#ffe6cc",
+          "tooltip": "Box quantity adjustment applied"
+        }
+      }
+    }
+  ],
+  "summary": {
+    "total_products": 1,
+    "predictions_generated": 1,
+    "model_version": "1.0.0",
+    "processing_time_ms": 45
+  }
+}
+```
 
 ### Supported Order Schemes
 
@@ -339,8 +475,9 @@ CMD ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
 ### Key Dependencies
 - **Data Science**: pandas, numpy, scikit-learn, xgboost
 - **Visualization**: plotly
-- **Web Frameworks**: streamlit, fastapi, uvicorn
+- **Web Frameworks**: streamlit, streamlit-aggrid, fastapi, uvicorn
 - **File Handling**: openpyxl, xlrd
+- **Enhanced UI**: st-aggrid for professional data grids
 
 ## 🤝 Contributing
 
@@ -372,9 +509,21 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 🔄 Changelog
 
+### Version 2.0.0 (Latest)
+- 🎆 **Enhanced Interactive Grid**: Professional st-aggrid integration
+- 🎨 **Visual Business Rules**: Color-coded cells with hover tooltips
+- ✏️ **In-Grid Editing**: Direct editing with change tracking
+- 🔍 **Advanced Filtering**: Real-time filters with persistence
+- 📥 **One-Click Export**: Simplified download with automatic server backup
+- 🟢 **Change Highlighting**: Green background for user modifications
+- 📅 **Expiry Management**: MM/YY format support with tiered warnings
+- 🔄 **Filter Persistence**: Edits maintained across filter operations
+- 🏢 **Supplier Management**: Multi-select supplier exclusion
+- 📊 **Excel Preview**: True WYSIWYG grid experience
+
 ### Version 1.0.0
 - Initial release with complete ML pipeline
-- Streamlit web interface
+- Basic Streamlit web interface
 - FastAPI REST service
 - Comprehensive documentation
 - Support for Excel file processing

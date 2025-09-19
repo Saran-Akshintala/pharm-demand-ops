@@ -26,6 +26,7 @@ from utils import (
     compute_predicted_order_with_adjustments
 )
 from retrain import ModelRetrainer, ModelRegistry
+from enhanced_grid import create_enhanced_grid, process_grid_changes, show_grid_changes_summary
 
 # Load custom CSS (deprecated) - default Streamlit styling only
 def load_css():
@@ -396,6 +397,95 @@ def prediction_tab():
             
             st.markdown("---")  # Add separator line
             
+            # Add new UI controls for filtering and editing
+            st.markdown("### 🎛️ Display & Export Options")
+            
+            # Create columns for the filter controls
+            filter_col1, filter_col2 = st.columns([1, 2])
+            
+            with filter_col1:
+                ignore_no_order = st.checkbox(
+                    "Ignore No Order", 
+                    value=False, 
+                    key="ignore_no_order_checkbox",
+                    help="Hide rows where Predicted_Order = 'No Order' from display and export"
+                )
+            
+            with filter_col2:
+                # Get unique suppliers from the data
+                supplier_col = None
+                supplier_variations = ['Supplier', 'Supplier Name', 'supplier', 'supplier_name', 'SUPPLIER']
+                
+                for col_name in supplier_variations:
+                    if col_name in df_result.columns:
+                        supplier_col = col_name
+                        break
+                
+                if supplier_col is None:
+                    # Try case-insensitive search
+                    for col in df_result.columns:
+                        if 'supplier' in str(col).lower():
+                            supplier_col = col
+                            break
+                
+                if supplier_col and supplier_col in df_result.columns:
+                    unique_suppliers = sorted(df_result[supplier_col].dropna().unique().tolist())
+                    excluded_suppliers = st.multiselect(
+                        "Exclude Suppliers",
+                        options=unique_suppliers,
+                        default=[],
+                        key="excluded_suppliers_multiselect",
+                        help="Select suppliers to exclude from display and export"
+                    )
+                else:
+                    excluded_suppliers = []
+                    st.info("No Supplier column found in data")
+            
+            # Determine the base data to filter (use edited data if available)
+            base_data_for_filtering = df_result.copy()
+            if 'edited_data' in st.session_state and st.session_state.edited_data is not None:
+                # Use edited data for filtering, but ensure it has the same structure
+                if (len(st.session_state.edited_data) == len(df_result) and 
+                    list(st.session_state.edited_data.columns) == list(df_result.columns)):
+                    base_data_for_filtering = st.session_state.edited_data.copy()
+                    # Reset index to match original data for styling mapping
+                    base_data_for_filtering.index = df_result.index
+            
+            # Apply filters to the data (now works with edited data)
+            df_filtered = base_data_for_filtering.copy()
+            
+            # Filter out "No Order" rows if checkbox is selected
+            if ignore_no_order:
+                df_filtered = df_filtered[df_filtered['Predicted_Order'] != 'No Order']
+            
+            # Filter out excluded suppliers
+            if supplier_col and excluded_suppliers:
+                df_filtered = df_filtered[~df_filtered[supplier_col].isin(excluded_suppliers)]
+            
+            # Store original indices before resetting for styling mapping
+            original_indices = df_filtered.index.tolist()
+            
+            # Reset index for filtered data to ensure proper display
+            df_filtered = df_filtered.reset_index(drop=True)
+            
+            # Update styling info to match filtered data with new sequential indices
+            filtered_styling_info = {}
+            filtered_expiry_styling = {}
+            
+            if styling_info:
+                # Map original indices to new sequential indices (0, 1, 2, ...)
+                for new_idx, orig_idx in enumerate(original_indices):
+                    if orig_idx in styling_info:
+                        filtered_styling_info[new_idx] = styling_info[orig_idx]
+            
+            if expiry_styling:
+                # Map original indices to new sequential indices (0, 1, 2, ...)
+                for new_idx, orig_idx in enumerate(original_indices):
+                    if orig_idx in expiry_styling:
+                        filtered_expiry_styling[new_idx] = expiry_styling[orig_idx]
+            
+            st.markdown(f"**Showing {len(df_filtered)} of {len(base_data_for_filtering)} rows**")
+            
             # Apply styling based on business rules
             def apply_business_rule_styling(df, styling_info, expiry_styling=None):
                 styler = df.style
@@ -452,30 +542,166 @@ def prediction_tab():
                 
                 return styler
             
-            if styling_info:
-                styled_df = apply_business_rule_styling(df_result, styling_info, expiry_styling)
-                st.dataframe(styled_df, use_container_width=True)
+            # Enhanced editable data grid with Excel preview features
+            if 'Predicted_Order' in df_filtered.columns:
+                st.markdown("### ✏️ Enhanced Editable Data Grid")
+                st.info("💡 This grid shows exactly what your Excel export will look like - with colors, tooltips, and editable Predicted_Order values. Hover over cells for business rule explanations.")
                 
-                # Display tooltip information as expandable section
+                # The enhanced grid should display the filtered data directly
+                # The filtering logic above already handles edited data properly
+                initial_grid_data = df_filtered.copy()
+                
+                # Note: df_filtered already contains edited data if available,
+                # and has been properly filtered by ignore_no_order and excluded_suppliers
+                # No additional edit persistence logic needed here since df_filtered
+                # is already built from base_data_for_filtering which includes edits
+                
+                # Create enhanced grid with color highlighting and tooltips
+                try:
+                    # For change tracking, we need to compare against the base data (before any user edits)
+                    # If we have edited data in session state, use df_result as original
+                    # If no edits yet, use the current data as both original and current
+                    original_for_tracking = df_result if 'edited_data' in st.session_state and st.session_state.edited_data is not None else initial_grid_data
+                    
+                    # Create a unique key that changes when filters change to force grid refresh
+                    grid_key = f"enhanced_editable_grid_{ignore_no_order}_{len(excluded_suppliers)}_{len(df_filtered)}"
+                    
+                    grid_response = create_enhanced_grid(
+                        initial_grid_data,
+                        styling_info=filtered_styling_info,
+                        expiry_styling=filtered_expiry_styling,
+                        original_data=original_for_tracking,  # Pass appropriate original data for change tracking
+                        key=grid_key
+                    )
+                    
+                    # Process grid changes and update session state
+                    if grid_response and 'data' in grid_response:
+                        # Process the changes from the enhanced grid
+                        updated_df = process_grid_changes(
+                            initial_grid_data,
+                            grid_response,
+                            product_key_columns=['Name', 'Supplier', 'Stock']
+                        )
+                        
+                        # Apply the changes back to the full dataset (not just filtered data)
+                        # This ensures we maintain the complete dataset with user edits
+                        if 'edited_data' not in st.session_state or st.session_state.edited_data is None:
+                            st.session_state.edited_data = df_result.copy()
+                        
+                        # Apply the changes from the grid to the full dataset using product key mapping
+                        try:
+                            # Create mapping of changes from the updated filtered data
+                            changes_map = {}
+                            for idx, row in updated_df.iterrows():
+                                # Create product key
+                                key_fields = []
+                                if 'Name' in row:
+                                    key_fields.append(str(row['Name']))
+                                if 'Supplier' in row:
+                                    key_fields.append(str(row['Supplier']))
+                                if 'Stock' in row:
+                                    key_fields.append(str(row['Stock']))
+                                
+                                if key_fields:
+                                    product_key = '|'.join(key_fields)
+                                    changes_map[product_key] = row['Predicted_Order']
+                            
+                            # Apply changes to the full dataset
+                            for idx, row in st.session_state.edited_data.iterrows():
+                                key_fields = []
+                                if 'Name' in row:
+                                    key_fields.append(str(row['Name']))
+                                if 'Supplier' in row:
+                                    key_fields.append(str(row['Supplier']))
+                                if 'Stock' in row:
+                                    key_fields.append(str(row['Stock']))
+                                
+                                if key_fields:
+                                    product_key = '|'.join(key_fields)
+                                    if product_key in changes_map:
+                                        st.session_state.edited_data.iloc[idx, st.session_state.edited_data.columns.get_loc('Predicted_Order')] = changes_map[product_key]
+                        
+                        except Exception as e:
+                            st.warning(f"Error applying grid changes: {str(e)}")
+                            # Fallback: just store the updated filtered data
+                            st.session_state.edited_data = updated_df
+                        
+                        # Show changes summary
+                        show_grid_changes_summary(initial_grid_data, updated_df)
+                        
+                        # Also show overall changes from original data
+                        if 'edited_data' in st.session_state and st.session_state.edited_data is not None:
+                            # Count total changes across all data
+                            total_changes = 0
+                            try:
+                                for idx, row in st.session_state.edited_data.iterrows():
+                                    if idx < len(df_result):
+                                        original_val = df_result.iloc[idx]['Predicted_Order']
+                                        edited_val = row['Predicted_Order']
+                                        if str(original_val) != str(edited_val):
+                                            total_changes += 1
+                                
+                                if total_changes > 0:
+                                    st.info(f"📊 Total changes made: {total_changes} rows edited across all data")
+                            except Exception as e:
+                                st.warning(f"Could not calculate total changes: {str(e)}")
+                
+                except Exception as e:
+                    st.error(f"Error creating enhanced grid: {str(e)}")
+                    st.warning("Falling back to basic editable grid...")
+                    
+                    # Fallback to basic st.data_editor
+                    column_config = {
+                        "Predicted_Order": st.column_config.TextColumn(
+                            "Predicted_Order",
+                            help="Edit predicted order values",
+                            max_chars=20,
+                        )
+                    }
+                    
+                    edited_df = st.data_editor(
+                        initial_grid_data,
+                        column_config=column_config,
+                        disabled=[col for col in initial_grid_data.columns if col != 'Predicted_Order'],
+                        use_container_width=True,
+                        key="fallback_editable_data_grid"
+                    )
+                    
+                    st.session_state.edited_data = edited_df
+            else:
+                # Fallback if no Predicted_Order column - show enhanced grid in read-only mode
+                try:
+                    grid_response = create_enhanced_grid(
+                        df_filtered,
+                        styling_info=filtered_styling_info,
+                        expiry_styling=filtered_expiry_styling,
+                        key="readonly_enhanced_grid"
+                    )
+                except Exception as e:
+                    st.warning(f"Could not create enhanced grid: {str(e)}")
+                    st.dataframe(df_filtered, use_container_width=True)
+                
+            # Display tooltip information as expandable section
+            if filtered_styling_info or filtered_expiry_styling:
                 with st.expander("📝 View Highlighting Reasons", expanded=False):
                     st.markdown("**Rows with business rule highlighting:**")
                     tooltip_data = []
                     
                     # Combine Predicted_Order and Expiry tooltips
-                    all_highlighted_rows = set(styling_info.keys())
-                    if expiry_styling:
-                        all_highlighted_rows.update(expiry_styling.keys())
+                    all_highlighted_rows = set(filtered_styling_info.keys())
+                    if filtered_expiry_styling:
+                        all_highlighted_rows.update(filtered_expiry_styling.keys())
                     
                     for row_idx in sorted(all_highlighted_rows):
-                        if row_idx < len(df_result):
-                            product_name = df_result.iloc[row_idx].get('Name', f'Row {row_idx + 1}')
-                            predicted_order = df_result.iloc[row_idx].get('Predicted_Order', 'N/A')
+                        if row_idx < len(df_filtered):
+                            product_name = df_filtered.iloc[row_idx].get('Name', f'Row {row_idx + 1}')
+                            predicted_order = df_filtered.iloc[row_idx].get('Predicted_Order', 'N/A')
                             
                             reasons = []
-                            if row_idx in styling_info:
-                                reasons.append(f"Predicted_Order: {styling_info[row_idx]['tooltip']}")
-                            if expiry_styling and row_idx in expiry_styling:
-                                reasons.append(f"Expiry: {expiry_styling[row_idx]['tooltip']}")
+                            if row_idx in filtered_styling_info:
+                                reasons.append(f"Predicted_Order: {filtered_styling_info[row_idx]['tooltip']}")
+                            if filtered_expiry_styling and row_idx in filtered_expiry_styling:
+                                reasons.append(f"Expiry: {filtered_expiry_styling[row_idx]['tooltip']}")
                             
                             tooltip_data.append({
                                 'Product': str(product_name)[:50] + '...' if len(str(product_name)) > 50 else str(product_name),
@@ -496,7 +722,7 @@ def prediction_tab():
                 with col1:
                     st.markdown('<div style="background-color: #ffcccc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🔴 Reddish: Days > 90 / Uneven Sales</div>', unsafe_allow_html=True)
                 with col2:
-                    st.markdown('<div style="background-color: #ccffcc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟢 Greenish: Negative after Stock</div>', unsafe_allow_html=True)
+                    st.markdown('<div style="background-color: #ccffcc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟢 Greenish: Edited in the UI</div>', unsafe_allow_html=True)
                 with col3:
                     st.markdown('<div style="background-color: #ffe6cc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟠 Orangish: Box Adjustment ±2</div>', unsafe_allow_html=True)
                 with col4:
@@ -510,77 +736,136 @@ def prediction_tab():
                     st.markdown('<div style="background-color: #ffe6cc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟠 Soon: Expiring ≤ 3 months</div>', unsafe_allow_html=True)
                 with col3:
                     st.markdown('<div style="background-color: #fff2cc; padding: 5px; border-radius: 3px; text-align: center; color: black;">🟡 Moderate: Expiring ≤ 5 months</div>', unsafe_allow_html=True)
-            else:
-                st.dataframe(df_result, use_container_width=True)
 
             # Download button
             st.markdown("### 💾 Download Results")
             
-            # Convert to Excel for download with styling
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df_result.to_excel(writer, index=False, sheet_name='Predictions')
+            # Show what will be exported (but don't generate Excel until download is clicked)
+            # Determine which data to export - use edited data if available, otherwise filtered data
+            export_df = df_filtered.copy()
+            if 'edited_data' in st.session_state and st.session_state.edited_data is not None:
+                # Apply the same filters to the edited data
+                export_df = st.session_state.edited_data.copy()
                 
-                # Apply styling to Excel file
-                if styling_info or expiry_styling:
-                    from openpyxl.styles import PatternFill
-                    from openpyxl.comments import Comment
-                    
-                    worksheet = writer.sheets['Predictions']
-                    
-                    # Find Predicted_Order column
-                    predicted_order_col = None
-                    for col_idx, col_name in enumerate(df_result.columns, 1):
-                        if col_name == 'Predicted_Order':
-                            predicted_order_col = col_idx
-                            break
-                    
-                    # Find Expiry column
-                    expiry_col = None
-                    expiry_col_variations = ['Expiry', 'Expiry Date', 'Exp', 'Exp Date', 'expiry', 'expiry_date']
-                    for col_idx, col_name in enumerate(df_result.columns, 1):
-                        if col_name in expiry_col_variations or 'expiry' in str(col_name).lower():
-                            expiry_col = col_idx
-                            break
-                    
-                    # Apply Predicted_Order styling
-                    if styling_info and predicted_order_col:
-                        for row_idx, style_info in styling_info.items():
-                            excel_row = row_idx + 2  # +2 because Excel is 1-indexed and has header
-                            cell = worksheet.cell(row=excel_row, column=predicted_order_col)
-                            
-                            # Only apply background color if color is not None (skip "No Order" cases)
-                            if style_info.get('color') is not None:
-                                color_hex = style_info['color'].replace('#', '')
-                                fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
-                                cell.fill = fill
-                            
-                            # Always add comment with tooltip (including "No Order" explanations)
-                            comment = Comment(style_info['tooltip'], 'Business Rules')
-                            cell.comment = comment
-                    
-                    # Apply Expiry column styling
-                    if expiry_styling and expiry_col:
-                        for row_idx, expiry_style in expiry_styling.items():
-                            excel_row = row_idx + 2  # +2 because Excel is 1-indexed and has header
-                            cell = worksheet.cell(row=excel_row, column=expiry_col)
-                            
-                            # Apply background color
-                            color_hex = expiry_style['color'].replace('#', '')
-                            fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
-                            cell.fill = fill
-                            
-                            # Add comment with expiry tooltip
-                            comment = Comment(expiry_style['tooltip'], 'Expiry Alert')
-                            cell.comment = comment
+                # Apply "Ignore No Order" filter to edited data
+                if ignore_no_order:
+                    export_df = export_df[export_df['Predicted_Order'] != 'No Order']
+                
+                # Apply supplier filter to edited data
+                if supplier_col and excluded_suppliers:
+                    export_df = export_df[~export_df[supplier_col].isin(excluded_suppliers)]
             
-            excel_data = output.getvalue()
+            # Show export summary
+            export_summary_col1, export_summary_col2 = st.columns(2)
+            with export_summary_col1:
+                st.info(f"📊 **Export Preview:**\n- Total rows: {len(export_df)}\n- Filtered out: {len(base_data_for_filtering) - len(export_df)} rows")
+            with export_summary_col2:
+                if ignore_no_order:
+                    st.info("🚫 'No Order' rows excluded")
+                if excluded_suppliers:
+                    st.info(f"🏢 {len(excluded_suppliers)} supplier(s) excluded")
+                if 'edited_data' in st.session_state and st.session_state.edited_data is not None:
+                    st.info("✏️ Manual edits included")
             
+            # Generate Excel only when download button is clicked
+            def generate_excel_with_styling():
+                """Generate Excel file with styling only when needed."""
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    export_df.to_excel(writer, index=False, sheet_name='Predictions')
+                    
+                    # Apply styling to Excel file (only for filtered data)
+                    if filtered_styling_info or filtered_expiry_styling:
+                        from openpyxl.styles import PatternFill
+                        from openpyxl.comments import Comment
+                        
+                        worksheet = writer.sheets['Predictions']
+                        
+                        # Find Predicted_Order column
+                        predicted_order_col = None
+                        for col_idx, col_name in enumerate(export_df.columns, 1):
+                            if col_name == 'Predicted_Order':
+                                predicted_order_col = col_idx
+                                break
+                        
+                        # Find Expiry column
+                        expiry_col = None
+                        expiry_col_variations = ['Expiry', 'Expiry Date', 'Exp', 'Exp Date', 'expiry', 'expiry_date']
+                        for col_idx, col_name in enumerate(export_df.columns, 1):
+                            if col_name in expiry_col_variations or 'expiry' in str(col_name).lower():
+                                expiry_col = col_idx
+                                break
+                        
+                        # Apply Predicted_Order styling (adjusted for filtered data)
+                        if filtered_styling_info and predicted_order_col:
+                            for row_idx, style_info in filtered_styling_info.items():
+                                excel_row = row_idx + 2  # +2 because Excel is 1-indexed and has header
+                                if excel_row <= len(export_df) + 1:  # Ensure we don't exceed export data bounds
+                                    cell = worksheet.cell(row=excel_row, column=predicted_order_col)
+                                    
+                                    # Only apply background color if color is not None (skip "No Order" cases)
+                                    if style_info.get('color') is not None:
+                                        color_hex = style_info['color'].replace('#', '')
+                                        fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
+                                        cell.fill = fill
+                                    
+                                    # Always add comment with tooltip (including "No Order" explanations)
+                                    comment = Comment(style_info['tooltip'], 'Business Rules')
+                                    cell.comment = comment
+                        
+                        # Apply Expiry column styling (adjusted for filtered data)
+                        if filtered_expiry_styling and expiry_col:
+                            for row_idx, expiry_style in filtered_expiry_styling.items():
+                                excel_row = row_idx + 2  # +2 because Excel is 1-indexed and has header
+                                if excel_row <= len(export_df) + 1:  # Ensure we don't exceed export data bounds
+                                    cell = worksheet.cell(row=excel_row, column=expiry_col)
+                                    
+                                    # Apply background color
+                                    color_hex = expiry_style['color'].replace('#', '')
+                                    fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
+                                    cell.fill = fill
+                                    
+                                    # Add comment with expiry tooltip
+                                    comment = Comment(expiry_style['tooltip'], 'Expiry Alert')
+                                    cell.comment = comment
+                
+                excel_data = output.getvalue()
+                
+                # Generate filename with timestamp
+                timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+                filename = f"pharmacy_predictions_{timestamp}.xlsx"
+                
+                # Save a copy to server for model retraining (only when download is clicked)
+                try:
+                    # Create reports directory if it doesn't exist
+                    script_dir = Path(__file__).parent.absolute()
+                    reports_dir = script_dir.parent / "data" / "reports"
+                    reports_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save server copy
+                    server_file_path = reports_dir / filename
+                    with open(server_file_path, 'wb') as f:
+                        f.write(excel_data)
+                    
+                    st.success(f"✅ Server copy saved: {server_file_path.name}")
+                    
+                except Exception as e:
+                    st.warning(f"⚠️ Could not save server copy: {str(e)}")
+                
+                return excel_data, filename
+            
+            # Single button that generates Excel and provides download automatically
+            with st.spinner("Generating Excel file with styling..."):
+                excel_data, filename = generate_excel_with_styling()
+            
+            # Provide download button (always available after generation)
             st.download_button(
-                label="📥 Download Excel with Predictions",
+                label="📅 Generate & Download Excel with Predictions",
                 data=excel_data,
-                file_name=f"pharmacy_predictions_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                help="Click to download Excel file with all predictions, styling, and your edits. Server copy will be automatically saved."
             )
     
     # Footer
