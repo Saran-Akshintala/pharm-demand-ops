@@ -6,12 +6,14 @@ Upload Excel files, get predictions, and download results.
 import streamlit as st
 import pandas as pd
 import numpy as np
+from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
-import json
 import sys
 from io import BytesIO
+import json
+from streamlit_compat import safe_download_button, safe_button
 
 # Add current directory to path for imports
 sys.path.append('.')
@@ -343,7 +345,7 @@ def prediction_tab():
                 scm_tolerance_val = st.number_input("Scm tolerance", min_value=0, max_value=10, value=2, step=1, key="scm_tolerance_input")
             
             with col5:
-                generate_button = st.button("Generate", type="primary", key="generate_button", help="Regenerate Predicted_Order with current settings")
+                generate_button = safe_button("Generate", key="generate_button", type="primary", help="Regenerate Predicted_Order with current settings")
             
             # Initialize session state for settings
             if 'current_settings' not in st.session_state:
@@ -859,7 +861,7 @@ def prediction_tab():
                 excel_data, filename = generate_excel_with_styling()
             
             # Provide download button (always available after generation)
-            st.download_button(
+            safe_download_button(
                 label="📅 Generate & Download Excel with Predictions",
                 data=excel_data,
                 file_name=filename,
@@ -912,7 +914,7 @@ def retraining_tab():
         )
         
         # Retrain button
-        if st.button("🚀 Start Retraining", type="primary", disabled=not uploaded_files):
+        if safe_button("🚀 Start Retraining", type="primary", disabled=not uploaded_files):
             if uploaded_files:
                 with st.spinner("🔄 Retraining model... This may take a few minutes."):
                     result = retrainer.retrain_pipeline(uploaded_files, incremental=incremental_training)
@@ -986,7 +988,7 @@ def retraining_tab():
         col1, col2 = st.columns(2)
         
         with col1:
-            if st.button("✅ Accept New Model", type="primary"):
+            if safe_button("✅ Accept New Model", type="primary"):
                 with st.spinner("Finalizing new model..."):
                     final_version = retrainer.finalize_model(
                         result['temp_version'],
