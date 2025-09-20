@@ -53,7 +53,7 @@ st.set_page_config(
 
 # Default Streamlit styling only (no CSS injection)
 
-def process_uploaded_file(uploaded_file, apply_box=True, box_tolerance=2, apply_scm=True, scm_tolerance=2):
+def process_uploaded_file(uploaded_file, apply_box=True, box_tolerance=2, apply_scm=True, scm_tolerance=2, base_multiplier=1.0):
     """Process uploaded Excel file and return predictions with configurable adjustments"""
     try:
         # Read the uploaded file
@@ -108,7 +108,9 @@ def process_uploaded_file(uploaded_file, apply_box=True, box_tolerance=2, apply_
         
         # Add predictions to original dataframe
         df_result = df.copy()
-        df_result['Predicted_Base_Quantity'] = predictions.round().astype(int)
+        # Apply multiplier to base predictions before any adjustments
+        base_predictions = predictions.round().astype(int) * base_multiplier
+        df_result['Predicted_Base_Quantity'] = base_predictions.round().astype(int)
         
         # Use new deterministic logic to compute Predicted_Order from Predicted_Base_Quantity
         df_result = compute_predicted_order_with_adjustments(
@@ -126,30 +128,61 @@ def process_uploaded_file(uploaded_file, apply_box=True, box_tolerance=2, apply_
         from utils import apply_expiry_highlighting
         expiry_styling = apply_expiry_highlighting(df_result)
         
-        # Reorder columns to place predictions next to Order column (fix from memory)
-        order_col = None
-        # Check for various order column name variations
+        # Remove unnecessary columns containing 'order', 'ord', or 'oreder' (case-insensitive)
+        cols_to_remove = []
         for col in df_result.columns:
             col_lower = col.lower()
-            if col_lower in ['order', 'ord', 'oreder']:
-                order_col = col
+            if any(term in col_lower for term in ['order', 'ord', 'oreder']) and col not in ['Predicted_Order'] and not col.startswith('Predicted_Base'):
+                cols_to_remove.append(col)
+        
+        if cols_to_remove:
+            df_result = df_result.drop(columns=cols_to_remove)
+        
+        # Reorder columns to place predictions after Stock column
+        stock_col = None
+        # Check for Stock column variations
+        for col in df_result.columns:
+            col_lower = col.lower()
+            if col_lower in ['stock', 'stocks', 'inventory']:
+                stock_col = col
                 break
         
-        if order_col:
-            # Use df_result.columns (after adding predictions) instead of df.columns
+        if stock_col:
+            # Use df_result.columns (after adding predictions and removing unwanted columns)
             cols = list(df_result.columns)
             
+            # Find the Predicted_Base column (with dynamic name)
+            predicted_base_col = None
+            for col in df_result.columns:
+                if col.startswith('Predicted_Base'):
+                    predicted_base_col = col
+                    break
+            
             # Remove prediction columns from their current positions
-            cols = [col for col in cols if col not in ['Predicted_Order', 'Predicted_Base_Quantity']]
+            cols = [col for col in cols if col not in ['Predicted_Order'] and not col.startswith('Predicted_Base')]
             
-            # Find the position of the Order column
-            order_idx = cols.index(order_col)
+            # Find the position of the Stock column
+            stock_idx = cols.index(stock_col)
             
-            # Insert prediction columns right after Order column
-            cols.insert(order_idx + 1, 'Predicted_Order')
-            cols.insert(order_idx + 2, 'Predicted_Base_Quantity')
+            # Insert prediction columns right after Stock column
+            cols.insert(stock_idx + 1, 'Predicted_Order')
+            if predicted_base_col:
+                cols.insert(stock_idx + 2, predicted_base_col)
             
             # Reorder the dataframe
+            df_result = df_result.reindex(columns=cols)
+        else:
+            # If no Stock column found, just ensure predictions are at the end
+            predicted_base_col = None
+            for col in df_result.columns:
+                if col.startswith('Predicted_Base'):
+                    predicted_base_col = col
+                    break
+            
+            cols = [col for col in df_result.columns if col not in ['Predicted_Order'] and not col.startswith('Predicted_Base')]
+            cols.append('Predicted_Order')
+            if predicted_base_col:
+                cols.append(predicted_base_col)
             df_result = df_result.reindex(columns=cols)
         
         return df_result, df_processed, styling_info, expiry_styling
@@ -161,10 +194,21 @@ def process_uploaded_file(uploaded_file, apply_box=True, box_tolerance=2, apply_
 def create_visualizations(df_result, df_processed):
     """Create visualizations for the predictions"""
     
+    # Find the Predicted_Base column (with dynamic name)
+    predicted_base_col = None
+    for col in df_result.columns:
+        if col.startswith('Predicted_Base'):
+            predicted_base_col = col
+            break
+    
+    if predicted_base_col is None:
+        st.warning("⚠️ No Predicted_Base column found for visualizations")
+        return
+    
     # Prediction distribution
     fig_dist = px.histogram(
         df_result, 
-        x='Predicted_Base_Quantity',
+        x=predicted_base_col,
         title="📊 Distribution of Predicted Order Quantities",
         nbins=30,
         color_discrete_sequence=['#667eea']
@@ -178,15 +222,15 @@ def create_visualizations(df_result, df_processed):
     
     # Top products by predicted quantity
     if len(df_result) > 0:
-        top_products = df_result.nlargest(10, 'Predicted_Base_Quantity')[['Name', 'Predicted_Base_Quantity', 'Predicted_Order']]
+        top_products = df_result.nlargest(10, predicted_base_col)[['Name', predicted_base_col, 'Predicted_Order']]
         
         fig_top = px.bar(
             top_products,
-            x='Predicted_Base_Quantity',
+            x=predicted_base_col,
             y='Name',
             orientation='h',
             title="🔝 Top 10 Products by Predicted Quantity",
-            color='Predicted_Base_Quantity',
+            color=predicted_base_col,
             color_continuous_scale='viridis'
         )
         fig_top.update_layout(
@@ -269,11 +313,24 @@ def prediction_tab():
     if uploaded_file is not None:
         st.markdown('<div class="results-section">', unsafe_allow_html=True)
         
+        # Get initial multiplier value (default 1.0x)
+        initial_multiplier = 1.0
+        
         # Process the file
         with st.spinner("🔄 Processing your data..."):
-            result = process_uploaded_file(uploaded_file)
+            result = process_uploaded_file(uploaded_file, base_multiplier=initial_multiplier)
             if result[0] is not None:
                 df_result, df_processed, styling_info, expiry_styling = result
+                
+                # Rename Predicted_Base_Quantity column to shorter name with multiplier in header (initial load)
+                if 'Predicted_Base_Quantity' in df_result.columns:
+                    if initial_multiplier != 1.0:
+                        new_col_name = f"Predicted_Base({initial_multiplier}x)"
+                    else:
+                        new_col_name = "Predicted_Base"  # Keep short name for 1.0x
+                    
+                    # Rename the column
+                    df_result = df_result.rename(columns={'Predicted_Base_Quantity': new_col_name})
             else:
                 df_result, df_processed, styling_info, expiry_styling = None, None, None, None
         
@@ -283,18 +340,38 @@ def prediction_tab():
             # Display summary statistics
             st.markdown("## 📈 Prediction Summary")
             
+            # Find the Predicted_Base column (with dynamic name)
+            predicted_base_col = None
+            for col in df_result.columns:
+                if col.startswith('Predicted_Base'):
+                    predicted_base_col = col
+                    break
+            
+            # Show column header info (multiplier is now in column name)
+            if predicted_base_col:
+                avg_base_qty = df_result[predicted_base_col].mean()
+                current_multiplier = 1.0  # Default
+                if 'current_settings' in st.session_state:
+                    current_multiplier = st.session_state.current_settings.get('base_multiplier', 1.0)
+                
+                # Simple display since multiplier is now in column header
+                st.info(f"📈 Column: {predicted_base_col} | Average: {avg_base_qty:.1f}")
+            
             col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.metric("Total Products", len(df_result))
             with col2:
-                avg_prediction = df_result['Predicted_Base_Quantity'].mean()
-                st.metric("Avg Predicted Qty", f"{avg_prediction:.1f}")
+                if predicted_base_col:
+                    avg_prediction = df_result[predicted_base_col].mean()
+                    st.metric("Avg Predicted Qty", f"{avg_prediction:.1f}")
             with col3:
-                max_prediction = df_result['Predicted_Base_Quantity'].max()
-                st.metric("Max Predicted Qty", f"{max_prediction}")
+                if predicted_base_col:
+                    max_prediction = df_result[predicted_base_col].max()
+                    st.metric("Max Predicted Qty", f"{max_prediction}")
             with col4:
-                total_prediction = df_result['Predicted_Base_Quantity'].sum()
-                st.metric("Total Predicted Qty", f"{total_prediction:,}")
+                if predicted_base_col:
+                    total_prediction = df_result[predicted_base_col].sum()
+                    st.metric("Total Predicted Qty", f"{total_prediction:,}")
             
             # Add section divider
             st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
@@ -317,7 +394,7 @@ def prediction_tab():
                 st.markdown("""
                 **Predicted_Order Computation Priority:**
                 
-                1. **Stock Subtraction**: `Predicted_Order = Predicted_Base_Quantity - Stock`
+                1. **Stock Subtraction**: `Predicted_Order = Predicted_Base - Stock`
                 2. **Box Adjustment**: If result is within ±tolerance of Box quantity, adjust to Box quantity
                 3. **Scheme Adjustment**: If result is within ±tolerance of scheme total, apply scheme format
                 
@@ -329,8 +406,8 @@ def prediction_tab():
                 **Note**: Scheme results always sum to whole numbers (e.g., 4.5+0.5=5, not 4+0.5=4.5)
                 """)
             
-            # Create columns for compact layout
-            col1, col2, col3, col4, col5 = st.columns([2, 1, 2, 1, 1])
+            # Create columns for compact layout - added multiplier dropdown
+            col1, col2, col3, col4, col5, col6 = st.columns([2, 1, 2, 1, 1.5, 1])
             
             with col1:
                 apply_box_adj = st.checkbox("Apply Box Quantity", value=True, key="apply_box_checkbox")
@@ -345,6 +422,22 @@ def prediction_tab():
                 scm_tolerance_val = st.number_input("Scm tolerance", min_value=0, max_value=10, value=2, step=1, key="scm_tolerance_input")
             
             with col5:
+                # Predicted_Base Multiplier dropdown
+                multiplier_options = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2.0]
+                multiplier_labels = [f"{x}x" for x in multiplier_options]
+                selected_multiplier_idx = st.selectbox(
+                    "Predicted_Base Multiplier",
+                    range(len(multiplier_options)),
+                    format_func=lambda x: multiplier_labels[x],
+                    index=0,  # Default to 1.0x
+                    key="base_multiplier_select",
+                    help="Multiply Predicted_Base by this factor before applying adjustments. Changes automatically trigger regeneration."
+                )
+                base_multiplier = multiplier_options[selected_multiplier_idx]
+                
+                # Multiplier info is now shown in column header, no need for separate display
+            
+            with col6:
                 generate_button = safe_button("Generate", key="generate_button", type="primary", help="Regenerate Predicted_Order with current settings")
             
             # Initialize session state for settings
@@ -353,7 +446,8 @@ def prediction_tab():
                     'apply_box': True,
                     'box_tolerance': 2,
                     'apply_scm': True,
-                    'scm_tolerance': 2
+                    'scm_tolerance': 2,
+                    'base_multiplier': 1.0
                 }
             
             # Check if settings changed or Generate button clicked
@@ -361,17 +455,26 @@ def prediction_tab():
                 st.session_state.current_settings['apply_box'] != apply_box_adj or
                 st.session_state.current_settings['box_tolerance'] != box_tolerance_val or
                 st.session_state.current_settings['apply_scm'] != apply_scm_adj or
-                st.session_state.current_settings['scm_tolerance'] != scm_tolerance_val
+                st.session_state.current_settings['scm_tolerance'] != scm_tolerance_val or
+                st.session_state.current_settings['base_multiplier'] != base_multiplier
             )
             
-            # Regenerate if Generate button clicked or if this is initial load
+            # Regenerate if Generate button clicked, settings changed, or initial load
             if generate_button or settings_changed or 'df_result_adjusted' not in st.session_state:
+                if settings_changed:
+                    st.info(f"🔄 Settings changed - regenerating with {base_multiplier}x multiplier...")
+                    # Clear edited data when multiplier changes to avoid confusion
+                    if 'base_multiplier' in st.session_state.current_settings and st.session_state.current_settings['base_multiplier'] != base_multiplier:
+                        if 'edited_data' in st.session_state:
+                            del st.session_state.edited_data
+                        st.info("🗑️ Cleared previous edits due to multiplier change")
                 # Update current settings
                 st.session_state.current_settings = {
                     'apply_box': apply_box_adj,
                     'box_tolerance': box_tolerance_val,
                     'apply_scm': apply_scm_adj,
-                    'scm_tolerance': scm_tolerance_val
+                    'scm_tolerance': scm_tolerance_val,
+                    'base_multiplier': base_multiplier
                 }
                 
                 # Reprocess with new settings
@@ -381,11 +484,23 @@ def prediction_tab():
                         apply_box=apply_box_adj, 
                         box_tolerance=box_tolerance_val,
                         apply_scm=apply_scm_adj, 
-                        scm_tolerance=scm_tolerance_val
+                        scm_tolerance=scm_tolerance_val,
+                        base_multiplier=base_multiplier
                     )
                     if result_adjusted[0] is not None:
                         st.session_state.df_result_adjusted, st.session_state.df_processed_adjusted, st.session_state.styling_info_adjusted, st.session_state.expiry_styling_adjusted = result_adjusted
-                        st.success("✅ Predictions regenerated successfully!")
+                        
+                        # Rename Predicted_Base_Quantity column to shorter name with multiplier in header
+                        if 'Predicted_Base_Quantity' in st.session_state.df_result_adjusted.columns:
+                            if base_multiplier != 1.0:
+                                new_col_name = f"Predicted_Base({base_multiplier}x)"
+                            else:
+                                new_col_name = "Predicted_Base"  # Keep short name for 1.0x
+                            
+                            # Rename the column
+                            st.session_state.df_result_adjusted = st.session_state.df_result_adjusted.rename(columns={'Predicted_Base_Quantity': new_col_name})
+                        
+                        st.success(f"✅ Predictions regenerated successfully with {base_multiplier}x multiplier!")
                     else:
                         st.error("❌ Error regenerating predictions")
                         st.session_state.df_result_adjusted, st.session_state.df_processed_adjusted, st.session_state.styling_info_adjusted, st.session_state.expiry_styling_adjusted = None, None, None, None
@@ -553,6 +668,13 @@ def prediction_tab():
                 # The filtering logic above already handles edited data properly
                 initial_grid_data = df_filtered.copy()
                 
+                # Ensure we're using the most up-to-date data including any edits
+                # This prevents the grid from reverting changes on first edit
+                if 'edited_data' in st.session_state and st.session_state.edited_data is not None:
+                    # Double-check that initial_grid_data reflects the latest edits
+                    # by ensuring it came from the edited data source
+                    pass  # df_filtered should already include edits from base_data_for_filtering logic above
+                
                 # Note: df_filtered already contains edited data if available,
                 # and has been properly filtered by ignore_no_order and excluded_suppliers
                 # No additional edit persistence logic needed here since df_filtered
@@ -560,20 +682,42 @@ def prediction_tab():
                 
                 # Create enhanced grid with color highlighting and tooltips
                 try:
-                    # For change tracking, we need to compare against the base data (before any user edits)
-                    # If we have edited data in session state, use df_result as original
-                    # If no edits yet, use the current data as both original and current
-                    original_for_tracking = df_result if 'edited_data' in st.session_state and st.session_state.edited_data is not None else initial_grid_data
+                    # For change tracking, we need to detect MANUAL edits vs system-generated values
+                    # Use the current system-generated data (with current multiplier) as baseline
+                    # This way, green highlighting only appears for actual user edits
+                    if 'df_result_adjusted' in st.session_state and st.session_state.df_result_adjusted is not None:
+                        # Use current adjusted data (with current multiplier) as baseline for change detection
+                        system_baseline = st.session_state.df_result_adjusted
+                    else:
+                        # Fallback to current data
+                        system_baseline = df_result
                     
-                    # Create a unique key that changes when filters change to force grid refresh
-                    grid_key = f"enhanced_editable_grid_{ignore_no_order}_{len(excluded_suppliers)}_{len(df_filtered)}"
+                    # Apply same filters to baseline to match the filtered grid data
+                    baseline_for_tracking = system_baseline.copy()
+                    if ignore_no_order and 'Predicted_Order' in baseline_for_tracking.columns:
+                        baseline_for_tracking = baseline_for_tracking[baseline_for_tracking['Predicted_Order'] != 'No Order']
+                    
+                    if supplier_col and excluded_suppliers:
+                        baseline_for_tracking = baseline_for_tracking[~baseline_for_tracking[supplier_col].isin(excluded_suppliers)]
+                    
+                    # Reset index to match filtered data
+                    baseline_for_tracking = baseline_for_tracking.reset_index(drop=True)
+                    
+                    # This baseline represents the current system-generated values (with multiplier)
+                    # Green highlighting will show when user manually edits away from these values
+                    original_for_tracking = baseline_for_tracking
+                    
+                    # Create a stable key that only changes when filters or multiplier change
+                    current_multiplier = st.session_state.current_settings.get('base_multiplier', 1.0) if 'current_settings' in st.session_state else 1.0
+                    grid_key = f"enhanced_editable_grid_{ignore_no_order}_{len(excluded_suppliers)}_{len(df_filtered)}_{current_multiplier}"
                     
                     grid_response = create_enhanced_grid(
                         initial_grid_data,
                         styling_info=filtered_styling_info,
                         expiry_styling=filtered_expiry_styling,
                         original_data=original_for_tracking,  # Pass appropriate original data for change tracking
-                        key=grid_key
+                        key=grid_key,
+                        current_multiplier=current_multiplier  # Pass current multiplier for header tooltip
                     )
                     
                     # Process grid changes and update session state
@@ -628,10 +772,11 @@ def prediction_tab():
                             # Fallback: just store the updated filtered data
                             st.session_state.edited_data = updated_df
                         
-                        # Show changes summary
-                        show_grid_changes_summary(initial_grid_data, updated_df)
-                        
-                        # Also show overall changes from original data
+                        # Show changes summary if any changes were made
+                        if show_grid_changes_summary(initial_grid_data, updated_df):
+                            st.info("✏️ Manual edits included")
+                            # No need to refresh - grid should show changes automatically
+                        # Show overall changes from original data
                         if 'edited_data' in st.session_state and st.session_state.edited_data is not None:
                             # Count total changes across all data
                             total_changes = 0
@@ -673,11 +818,13 @@ def prediction_tab():
             else:
                 # Fallback if no Predicted_Order column - show enhanced grid in read-only mode
                 try:
+                    current_multiplier = st.session_state.current_settings.get('base_multiplier', 1.0) if 'current_settings' in st.session_state else 1.0
                     grid_response = create_enhanced_grid(
                         df_filtered,
                         styling_info=filtered_styling_info,
                         expiry_styling=filtered_expiry_styling,
-                        key="readonly_enhanced_grid"
+                        key="readonly_enhanced_grid",
+                        current_multiplier=current_multiplier
                     )
                 except Exception as e:
                     st.warning(f"Could not create enhanced grid: {str(e)}")
@@ -798,22 +945,60 @@ def prediction_tab():
                                 expiry_col = col_idx
                                 break
                         
-                        # Apply Predicted_Order styling (adjusted for filtered data)
+                        # Apply manual edit highlighting (green background) first
+                        if predicted_order_col and 'edited_data' in st.session_state and st.session_state.edited_data is not None:
+                            # Detect manual edits by comparing export_df with system baseline
+                            system_baseline = st.session_state.df_result_adjusted if 'df_result_adjusted' in st.session_state else df_result
+                            
+                            # Apply same filters to baseline
+                            baseline_filtered = system_baseline.copy()
+                            if ignore_no_order and 'Predicted_Order' in baseline_filtered.columns:
+                                baseline_filtered = baseline_filtered[baseline_filtered['Predicted_Order'] != 'No Order']
+                            if supplier_col and excluded_suppliers:
+                                baseline_filtered = baseline_filtered[~baseline_filtered[supplier_col].isin(excluded_suppliers)]
+                            baseline_filtered = baseline_filtered.reset_index(drop=True)
+                            
+                            # Compare and highlight manual edits
+                            for idx in range(min(len(export_df), len(baseline_filtered))):
+                                if idx < len(export_df) and idx < len(baseline_filtered):
+                                    current_val = str(export_df.iloc[idx]['Predicted_Order'])
+                                    baseline_val = str(baseline_filtered.iloc[idx]['Predicted_Order'])
+                                    
+                                    if current_val != baseline_val:
+                                        # This is a manual edit - apply green background
+                                        excel_row = idx + 2  # +2 because Excel is 1-indexed and has header
+                                        cell = worksheet.cell(row=excel_row, column=predicted_order_col)
+                                        # Light green background for manual edits
+                                        green_fill = PatternFill(start_color='d4edda', end_color='d4edda', fill_type='solid')
+                                        cell.fill = green_fill
+                                        
+                                        # Add comment indicating manual edit
+                                        edit_comment = Comment(f'Manual Edit: Changed from {baseline_val} to {current_val}', 'User Edit')
+                                        cell.comment = edit_comment
+                        
+                        # Apply business rule styling (but don't override manual edit green)
                         if filtered_styling_info and predicted_order_col:
                             for row_idx, style_info in filtered_styling_info.items():
                                 excel_row = row_idx + 2  # +2 because Excel is 1-indexed and has header
                                 if excel_row <= len(export_df) + 1:  # Ensure we don't exceed export data bounds
                                     cell = worksheet.cell(row=excel_row, column=predicted_order_col)
                                     
-                                    # Only apply background color if color is not None (skip "No Order" cases)
-                                    if style_info.get('color') is not None:
-                                        color_hex = style_info['color'].replace('#', '')
-                                        fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
-                                        cell.fill = fill
+                                    # Only apply business rule color if cell doesn't already have manual edit green
+                                    if cell.fill.start_color.rgb != 'FFd4edda':  # Not manual edit green
+                                        # Only apply background color if color is not None (skip "No Order" cases)
+                                        if style_info.get('color') is not None:
+                                            color_hex = style_info['color'].replace('#', '')
+                                            fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
+                                            cell.fill = fill
                                     
-                                    # Always add comment with tooltip (including "No Order" explanations)
-                                    comment = Comment(style_info['tooltip'], 'Business Rules')
-                                    cell.comment = comment
+                                    # Add business rule comment (append to existing comment if manual edit)
+                                    business_comment = Comment(style_info['tooltip'], 'Business Rules')
+                                    if cell.comment is None:
+                                        cell.comment = business_comment
+                                    else:
+                                        # Append to existing comment
+                                        existing_text = cell.comment.text
+                                        cell.comment = Comment(f'{existing_text}\n\nBusiness Rule: {style_info["tooltip"]}', 'Combined')
                         
                         # Apply Expiry column styling (adjusted for filtered data)
                         if filtered_expiry_styling and expiry_col:
@@ -856,19 +1041,167 @@ def prediction_tab():
                 
                 return excel_data, filename
             
-            # Single button that generates Excel and downloads only when clicked
-            if safe_button("📅 Generate & Download Excel with Predictions", type="primary", help="Click to generate and download Excel file with all predictions, styling, and your edits. Server copy will be automatically saved."):
-                with st.spinner("Generating Excel file with styling..."):
-                    excel_data, filename = generate_excel_with_styling()
+            # Single-click workflow: Generate Excel, save server copy, and trigger immediate download
+            # No server copy is saved until user explicitly clicks this button
+            
+            # Generate Excel with latest grid data including all manual edits
+            def generate_final_excel():
+                """Generate Excel file with latest data including all user edits"""
+                # Use export_df which already contains the latest filtered data with edits
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    export_df.to_excel(writer, index=False, sheet_name='Predictions')
                     
-                    # Provide download
-                    safe_download_button(
-                        label="💾 Download Generated File",
-                        data=excel_data,
-                        file_name=filename,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        help="Click to download the generated Excel file."
-                    )
+                    # Apply styling to Excel file (only for filtered data)
+                    if filtered_styling_info or filtered_expiry_styling:
+                        from openpyxl.styles import PatternFill
+                        from openpyxl.comments import Comment
+                        
+                        worksheet = writer.sheets['Predictions']
+                        
+                        # Find Predicted_Order column
+                        predicted_order_col = None
+                        for col_idx, col_name in enumerate(export_df.columns, 1):
+                            if col_name == 'Predicted_Order':
+                                predicted_order_col = col_idx
+                                break
+                        
+                        # Find Expiry column
+                        expiry_col = None
+                        expiry_col_variations = ['Expiry', 'Expiry Date', 'Exp', 'Exp Date', 'expiry', 'expiry_date']
+                        for col_idx, col_name in enumerate(export_df.columns, 1):
+                            if col_name in expiry_col_variations or 'expiry' in str(col_name).lower():
+                                expiry_col = col_idx
+                                break
+                        
+                        # Apply manual edit highlighting (green background) first
+                        if predicted_order_col and 'edited_data' in st.session_state and st.session_state.edited_data is not None:
+                            # Detect manual edits by comparing export_df with system baseline
+                            system_baseline = st.session_state.df_result_adjusted if 'df_result_adjusted' in st.session_state else df_result
+                            
+                            # Apply same filters to baseline
+                            baseline_filtered = system_baseline.copy()
+                            if ignore_no_order and 'Predicted_Order' in baseline_filtered.columns:
+                                baseline_filtered = baseline_filtered[baseline_filtered['Predicted_Order'] != 'No Order']
+                            if supplier_col and excluded_suppliers:
+                                baseline_filtered = baseline_filtered[~baseline_filtered[supplier_col].isin(excluded_suppliers)]
+                            baseline_filtered = baseline_filtered.reset_index(drop=True)
+                            
+                            # Compare and highlight manual edits
+                            for idx in range(min(len(export_df), len(baseline_filtered))):
+                                if idx < len(export_df) and idx < len(baseline_filtered):
+                                    current_val = str(export_df.iloc[idx]['Predicted_Order'])
+                                    baseline_val = str(baseline_filtered.iloc[idx]['Predicted_Order'])
+                                    
+                                    if current_val != baseline_val:
+                                        # This is a manual edit - apply green background
+                                        excel_row = idx + 2  # +2 because Excel is 1-indexed and has header
+                                        cell = worksheet.cell(row=excel_row, column=predicted_order_col)
+                                        # Light green background for manual edits
+                                        green_fill = PatternFill(start_color='d4edda', end_color='d4edda', fill_type='solid')
+                                        cell.fill = green_fill
+                                        
+                                        # Add comment indicating manual edit with change details
+                                        edit_comment = Comment(f'Edited in the UI: {baseline_val} → {current_val}', 'User Edit')
+                                        cell.comment = edit_comment
+                        
+                        # Apply business rule styling (but don't override manual edit green)
+                        if filtered_styling_info and predicted_order_col:
+                            for row_idx, style_info in filtered_styling_info.items():
+                                excel_row = row_idx + 2  # +2 because Excel is 1-indexed and has header
+                                if excel_row <= len(export_df) + 1:  # Ensure we don't exceed export data bounds
+                                    cell = worksheet.cell(row=excel_row, column=predicted_order_col)
+                                    
+                                    # Only apply business rule color if cell doesn't already have manual edit green
+                                    if cell.fill.start_color.rgb != 'FFd4edda':  # Not manual edit green
+                                        # Only apply background color if color is not None (skip "No Order" cases)
+                                        if style_info.get('color') is not None:
+                                            color_hex = style_info['color'].replace('#', '')
+                                            fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
+                                            cell.fill = fill
+                                    
+                                    # Add business rule comment (append to existing comment if manual edit)
+                                    business_comment = Comment(style_info['tooltip'], 'Business Rules')
+                                    if cell.comment is None:
+                                        cell.comment = business_comment
+                                    else:
+                                        # Append to existing comment
+                                        existing_text = cell.comment.text
+                                        cell.comment = Comment(f'{existing_text}\n\nBusiness Rule: {style_info["tooltip"]}', 'Combined')
+                        
+                        # Apply Expiry column styling (adjusted for filtered data)
+                        if filtered_expiry_styling and expiry_col:
+                            for row_idx, expiry_style in filtered_expiry_styling.items():
+                                excel_row = row_idx + 2  # +2 because Excel is 1-indexed and has header
+                                if excel_row <= len(export_df) + 1:  # Ensure we don't exceed export data bounds
+                                    cell = worksheet.cell(row=excel_row, column=expiry_col)
+                                    
+                                    # Apply background color
+                                    color_hex = expiry_style['color'].replace('#', '')
+                                    fill = PatternFill(start_color=color_hex, end_color=color_hex, fill_type='solid')
+                                    cell.fill = fill
+                                    
+                                    # Add comment
+                                    comment = Comment(expiry_style['tooltip'], 'Expiry Alert')
+                                    cell.comment = comment
+                
+                excel_data = output.getvalue()
+                
+                # Generate unique timestamped filename
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                filename = f"pharmacy_predictions_{timestamp}.xlsx"
+                
+                # Save server copy to /data/reports/
+                try:
+                    from pathlib import Path
+                    script_dir = Path(__file__).parent.absolute()
+                    reports_dir = script_dir.parent / "data" / "reports"
+                    reports_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save server copy
+                    server_file_path = reports_dir / filename
+                    with open(server_file_path, 'wb') as f:
+                        f.write(excel_data)
+                    
+                    st.success(f"✅ Server copy saved: {server_file_path.name}")
+                    
+                except Exception as e:
+                    st.warning(f"⚠️ Could not save server copy: {str(e)}")
+                
+                return excel_data, filename
+            
+            # Generate Excel data when needed (only when button will be clicked)
+            excel_data = None
+            filename = None
+            
+            # Check if user wants to download (using session state to track)
+            if 'generate_excel' not in st.session_state:
+                st.session_state.generate_excel = False
+            
+            # Single button that generates Excel, saves server copy, and provides immediate download
+            if safe_button("📅 Generate & Download Excel with Predictions", type="primary", help="Click to generate and download Excel file with all predictions, styling, and your edits. Server copy will be automatically saved."):
+                st.session_state.generate_excel = True
+            
+            # Generate Excel and provide download when requested
+            if st.session_state.generate_excel:
+                with st.spinner("Generating Excel file with styling..."):
+                    excel_data, filename = generate_final_excel()
+                    
+                # Reset the flag
+                st.session_state.generate_excel = False
+                
+                # Provide immediate download with clear messaging
+                st.success("✅ Excel file generated successfully!")
+                st.download_button(
+                    label="💾 Download Excel File",
+                    data=excel_data,
+                    file_name=filename,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    help="Click to download your Excel file with all edits and styling.",
+                    type="primary",
+                    use_container_width=True
+                )
     
     # Footer
     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)

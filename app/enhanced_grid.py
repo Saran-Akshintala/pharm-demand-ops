@@ -8,7 +8,7 @@ import streamlit as st
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode, JsCode
 from st_aggrid.shared import GridUpdateMode, DataReturnMode
 
-def create_enhanced_grid(df_data, styling_info=None, expiry_styling=None, original_data=None, key="enhanced_grid"):
+def create_enhanced_grid(df_data, styling_info=None, expiry_styling=None, original_data=None, key="enhanced_grid", current_multiplier=1.0):
     """
     Create an enhanced editable grid with color highlighting and tooltips.
     
@@ -58,13 +58,16 @@ def create_enhanced_grid(df_data, styling_info=None, expiry_styling=None, origin
             
             if key_fields:
                 product_key = '|'.join(key_fields)
-                original_val = original_values_map.get(product_key, row['Predicted_Order'])
+                # Get original value for change tracking
+                original_val = original_values_map.get(product_key)
+                # Keep original value for change tracking even if currently same
+                # This allows us to detect when user manually changes it back or to different value
             else:
-                original_val = row['Predicted_Order']  # Fallback to current value
+                original_val = None  # No change tracking if no product key
             
             original_values.append(original_val)
         
-        grid_data['_original_Predicted_Order'] = original_values
+        grid_data['_original_Predicted_Order'] = original_values  # Hidden column for change tracking
     
     # Add tooltip column for Predicted_Order
     if 'Predicted_Order' in grid_data.columns:
@@ -126,9 +129,29 @@ def create_enhanced_grid(df_data, styling_info=None, expiry_styling=None, origin
     if '_original_Predicted_Order' in grid_data.columns:
         gb.configure_column("_original_Predicted_Order", hide=True)
     
-    # Configure other columns as read-only
+    # Configure Predicted_Base column (with dynamic name based on multiplier)
+    predicted_base_col = None
     for col in grid_data.columns:
-        if col not in ['Predicted_Order', 'Predicted_Order_Tooltip', f'{expiry_col}_Tooltip'] and col != expiry_col:
+        if col.startswith('Predicted_Base'):
+            predicted_base_col = col
+            break
+    
+    if predicted_base_col:
+        gb.configure_column(
+            predicted_base_col,
+            editable=False,
+            headerTooltip="Base quantity predictions from ML model"
+        )
+    
+    # Configure other columns as read-only
+    excluded_cols = ['Predicted_Order', 'Predicted_Order_Tooltip', f'{expiry_col}_Tooltip']
+    if predicted_base_col:
+        excluded_cols.append(predicted_base_col)
+    if expiry_col:
+        excluded_cols.append(expiry_col)
+    
+    for col in grid_data.columns:
+        if col not in excluded_cols:
             gb.configure_column(col, editable=False)
     
     # General grid configuration
@@ -191,8 +214,10 @@ def create_cell_style_js(styling_info, is_predicted_order=True):
             const currentValue = params.value;
             const originalValue = params.data._original_Predicted_Order;
             
-            // Check if value has been changed
-            const isChanged = originalValue !== undefined && currentValue !== originalValue;
+            // Check if value has been changed (convert to strings for comparison)
+            const isChanged = originalValue !== undefined && 
+                             originalValue !== null && 
+                             String(currentValue) !== String(originalValue);
             
             // Priority: Change highlighting > Business rule colors
             if (isChanged) {{
