@@ -564,10 +564,12 @@ def apply_predicted_order_business_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame
                         # Check if box adjustment was applied
                         box_diff = abs(after_stock_subtraction - box_qty)
                         if box_diff <= 2 and abs(current_order_numeric - box_qty) < 0.1:
-                            conditions['box_adjustment'] = {
-                                'color': COLORS['orangish'],
-                                'tooltip': f'Adjusted to Box quantity: {after_stock_subtraction} → {box_qty}'
-                            }
+                            # Only show tooltip when Box > 1 AND the adjustment actually changed the value
+                            if box_qty > 1 and box_diff > 0.01:
+                                conditions['box_adjustment'] = {
+                                    'color': COLORS['orangish'],
+                                    'tooltip': f'Adjusted to Box quantity: {after_stock_subtraction} → {box_qty}'
+                                }
                 except:
                     pass
             
@@ -659,6 +661,53 @@ def apply_predicted_order_business_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame
                     'color': COLORS['reddish'],
                     'tooltip': f'Days since last purchase > 90 ({days_since_purchase})'
                 }
+        
+        # NEW BUSINESS RULE: Set "No Order" for rows with uneven sales pattern AND low values
+        # This rule applies only when uneven_sales tooltip is already triggered
+        if 'uneven_sales' in conditions:
+            # Get L90, Sales_Qty, and Stock values (handle column name variations)
+            l90_value = None
+            sales_qty_value = None
+            stock_value = stock_qty  # Already retrieved earlier
+            
+            # Get L90
+            if 'L90' in df_result.columns:
+                l90_value = row.get('L90')
+            
+            # Get Sales_Qty (handle variations: "Sales_Qty", "Sales Qty", etc.)
+            sales_qty_col = None
+            for col in df_result.columns:
+                col_lower = str(col).lower().replace(' ', '_')
+                if col_lower == 'sales_qty':
+                    sales_qty_col = col
+                    break
+            
+            if sales_qty_col:
+                sales_qty_value = row.get(sales_qty_col)
+            
+            # Convert to numeric and check if any is 1 or 2
+            should_set_no_order = False
+            try:
+                if l90_value is not None and pd.notna(l90_value):
+                    l90_num = pd.to_numeric(l90_value, errors='coerce')
+                    if pd.notna(l90_num) and l90_num in [1, 2]:
+                        should_set_no_order = True
+                
+                if not should_set_no_order and sales_qty_value is not None and pd.notna(sales_qty_value):
+                    sales_qty_num = pd.to_numeric(sales_qty_value, errors='coerce')
+                    if pd.notna(sales_qty_num) and sales_qty_num in [1, 2]:
+                        should_set_no_order = True
+                
+                if not should_set_no_order and stock_value is not None and pd.notna(stock_value):
+                    stock_num = pd.to_numeric(stock_value, errors='coerce')
+                    if pd.notna(stock_num) and stock_num in [1, 2]:
+                        should_set_no_order = True
+            except:
+                pass
+            
+            # If condition is met, set display_value to "No Order" but keep all conditions intact
+            if should_set_no_order:
+                display_value = "No Order"
         
         # ENHANCED: Support multiple tooltip messages
         selected_condition = None
@@ -921,41 +970,43 @@ def apply_scheme_to_quantity(final_quantity: float, row: pd.Series, df: pd.DataF
                                     elif trend_ratio > 1.3:  # Moderate growth
                                         demand_trend_factor = 1.2  # Standard increase
                         
-                        # Test valid scheme multipliers to find the best fit
-                        # Valid multipliers: 0.5x, 1x, 2x, 3x, 4x, 5x (maintaining base:bonus ratio)
-                        valid_multipliers = [0.5, 1, 2, 3, 4, 5]
+                        # Calculate multiplier dynamically: raw_m = final_quantity / total_scheme
+                        raw_m = final_quantity / total_scheme
                         
-                        best_multiplier = 1
-                        best_score = float('inf')
+                        # Round to nearest 0.5 step: m = round(raw_m * 2) / 2.0
+                        rounded_m = round(raw_m * 2) / 2.0
                         
-                        # Test each valid multiplier with trend consideration
-                        for test_mult in valid_multipliers:
-                            test_total = total_scheme * test_mult
-                            difference = abs(final_quantity - test_total)
+                        # If rounded_m is too small (< 0.5), fall back to existing behavior
+                        if rounded_m < 0.5:
+                            return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
+                        
+                        # Calculate candidate values
+                        candidate_base = scheme_base * rounded_m
+                        candidate_bonus = scheme_bonus * rounded_m
+                        candidate_total = candidate_base + candidate_bonus
+                        
+                        # Apply trend factor to adjust candidate if beneficial
+                        # For increasing demand, consider slightly higher multiplier
+                        if demand_trend_factor > 1.0:
+                            # Try next 0.5 step up if it's better
+                            next_m = rounded_m + 0.5
+                            next_total = total_scheme * next_m
+                            next_diff = abs(final_quantity - next_total)
+                            current_diff = abs(final_quantity - candidate_total)
                             
-                            # Apply enhanced trend factor: more aggressive for strong growth
-                            if demand_trend_factor >= 1.8 and test_total > final_quantity:
-                                # Very strong bonus for higher quantities with strong growth
-                                adjusted_difference = difference * 0.4
-                            elif demand_trend_factor >= 1.5 and test_total > final_quantity:
-                                # Strong bonus for higher quantities with good growth
-                                adjusted_difference = difference * 0.5
-                            elif demand_trend_factor > 1.0 and test_total > final_quantity:
-                                # Standard bonus for higher quantities when demand is increasing
-                                adjusted_difference = difference * 0.7
-                            elif demand_trend_factor < 1.0 and test_total < final_quantity:
-                                # Bonus for lower quantities when demand is decreasing
-                                adjusted_difference = difference * 0.7
-                            else:
-                                adjusted_difference = difference
-                            
-                            if adjusted_difference < best_score:
-                                best_score = adjusted_difference
-                                best_multiplier = test_mult
+                            # If next step is better (considering trend bonus), use it
+                            if next_total > final_quantity:
+                                trend_bonus = 0.7 if demand_trend_factor >= 1.5 else 0.8
+                                adjusted_next_diff = next_diff * trend_bonus
+                                if adjusted_next_diff < current_diff:
+                                    rounded_m = next_m
+                                    candidate_base = scheme_base * rounded_m
+                                    candidate_bonus = scheme_bonus * rounded_m
+                                    candidate_total = candidate_base + candidate_bonus
                         
-                        # Apply the best multiplier
-                        new_base = round_to_half(scheme_base * best_multiplier)
-                        new_bonus = round_to_half(scheme_bonus * best_multiplier)
+                        # Apply the multiplier (already rounded to 0.5 steps)
+                        new_base = round_to_half(candidate_base)
+                        new_bonus = round_to_half(candidate_bonus)
                         
                         return f"{format_value(new_base)}+{format_value(new_bonus)}"
                 else:
@@ -1234,65 +1285,41 @@ def _apply_scheme_adjustment_new(predicted_order_qty: float, row: pd.Series, df:
                 return f"{predicted_order_qty:.1f}"
         
         # Calculate original scheme total
-        original_scheme_total = scheme_base + scheme_bonus
+        scheme_total = scheme_base + scheme_bonus
         
-        # Check if predicted order quantity is within tolerance of the scheme total
-        difference = abs(predicted_order_qty - original_scheme_total)
+        if scheme_total <= 0:
+            # Invalid scheme total, fall back to simple number
+            if predicted_order_qty == int(predicted_order_qty):
+                return str(int(predicted_order_qty))
+            else:
+                return f"{predicted_order_qty:.1f}"
+        
+        # Calculate multiplier dynamically: raw_m = predicted_order_qty / scheme_total
+        raw_m = predicted_order_qty / scheme_total
+        
+        # Round to nearest 0.5 step: m = round(raw_m * 2) / 2.0
+        rounded_m = round(raw_m * 2) / 2.0
+        
+        # If rounded_m is too small (< 0.5), fall back to existing behavior
+        if rounded_m < 0.5:
+            if predicted_order_qty == int(predicted_order_qty):
+                return str(int(predicted_order_qty))
+            else:
+                return f"{predicted_order_qty:.1f}"
+        
+        # Calculate candidate values
+        candidate_base = scheme_base * rounded_m
+        candidate_bonus = scheme_bonus * rounded_m
+        candidate_total = candidate_base + candidate_bonus
+        
+        # Use existing tolerance logic to decide if candidate is acceptable
+        difference = abs(predicted_order_qty - candidate_total)
         
         if difference <= tolerance:
-            # Use the original scheme
-            base_str = str(int(scheme_base)) if scheme_base == int(scheme_base) else f"{scheme_base:.1f}"
-            bonus_str = str(int(scheme_bonus)) if scheme_bonus == int(scheme_bonus) else f"{scheme_bonus:.1f}"
-            return f"{base_str}+{bonus_str}"
-        
-        # Find the best valid multiplier (0.5x, 1x, 2x, 3x, 4x, 5x) that gets closest to predicted_order_qty
-        # Valid multipliers maintain the original base:bonus ratio
-        
-        valid_multipliers = [0.5, 1, 2, 3, 4, 5]  # Only these multipliers are allowed
-        best_scheme = None
-        best_difference = float('inf')
-        
-        for multiplier in valid_multipliers:
-            test_base = scheme_base * multiplier
-            test_bonus = scheme_bonus * multiplier
-            test_total = test_base + test_bonus
-            
-            # Check if this multiplier gets us close to predicted_order_qty
-            diff = abs(predicted_order_qty - test_total)
-            
-            if diff <= tolerance and diff < best_difference:
-                best_difference = diff
-                best_scheme = (test_base, test_bonus, multiplier)
-        
-        if best_scheme:
-            base_val, bonus_val, used_multiplier = best_scheme
-            
-            # EDGE CASE FIX: Ensure final sum is a whole number
-            total_sum = base_val + bonus_val
-            if total_sum != int(total_sum):
-                # Special handling for X+0.5 cases (e.g., 2+0.5, 3+0.5, 5+0.5)
-                if bonus_val == 0.5:
-                    # Increase the base by 0.5 to make sum whole
-                    # Examples: 2+0.5 → 2.5+0.5, 3+0.5 → 3.5+0.5, 5+0.5 → 5.5+0.5
-                    base_val += 0.5
-                elif base_val == 0.5:
-                    # If base is 0.5, increase bonus instead
-                    bonus_val += 0.5
-                else:
-                    # General case: round to nearest whole number and distribute
-                    target_sum = round(total_sum)
-                    diff = target_sum - total_sum
-                    
-                    # Add the difference to the larger component
-                    if base_val >= bonus_val:
-                        base_val += diff
-                    else:
-                        bonus_val += diff
-            
+            # Candidate is within tolerance, use it
             # Format the values properly
-            base_str = str(int(base_val)) if base_val == int(base_val) else f"{base_val:.1f}"
-            bonus_str = str(int(bonus_val)) if bonus_val == int(bonus_val) else f"{bonus_val:.1f}"
-            
+            base_str = str(int(candidate_base)) if candidate_base == int(candidate_base) else f"{candidate_base:.1f}"
+            bonus_str = str(int(candidate_bonus)) if candidate_bonus == int(candidate_bonus) else f"{candidate_bonus:.1f}"
             return f"{base_str}+{bonus_str}"
         
         # If no suitable scheme found, return as simple number
@@ -1368,8 +1395,15 @@ def _apply_scheme_adjustment(adjusted_qty: float, row: pd.Series, df: pd.DataFra
             else:
                 return f"{adjusted_qty:.1f}"
         
-        # Find optimal scheme multiplier
+        # Calculate scheme total
         total_scheme = scheme_base + scheme_bonus
+        
+        if total_scheme <= 0:
+            # Invalid scheme total, fall back to simple number
+            if adjusted_qty == int(adjusted_qty):
+                return str(int(adjusted_qty))
+            else:
+                return f"{adjusted_qty:.1f}"
         
         # For very small quantities, return as-is
         if adjusted_qty <= 1:
@@ -1378,64 +1412,54 @@ def _apply_scheme_adjustment(adjusted_qty: float, row: pd.Series, df: pd.DataFra
             else:
                 return f"{adjusted_qty:.1f}"
         
-        # Test valid multipliers: 0.5x, 1x, 2x, 3x, 4x, 5x
-        valid_multipliers = [0.5, 1, 2, 3, 4, 5]
-        best_multiplier = 1
-        best_difference = float('inf')
+        # Calculate multiplier dynamically: raw_m = adjusted_qty / total_scheme
+        raw_m = adjusted_qty / total_scheme
+        
+        # Round to nearest 0.5 step: m = round(raw_m * 2) / 2.0
+        rounded_m = round(raw_m * 2) / 2.0
+        
+        # If rounded_m is too small (< 0.5), fall back to existing behavior
+        if rounded_m < 0.5:
+            if adjusted_qty == int(adjusted_qty):
+                return str(int(adjusted_qty))
+            else:
+                return f"{adjusted_qty:.1f}"
         
         # Enhanced logic considering demand trends from memories
         demand_trend_factor = _calculate_demand_trend_factor(row, df)
         
-        for multiplier in valid_multipliers:
-            test_total = total_scheme * multiplier
-            difference = abs(adjusted_qty - test_total)
+        # Calculate candidate values
+        candidate_base = scheme_base * rounded_m
+        candidate_bonus = scheme_bonus * rounded_m
+        candidate_total = candidate_base + candidate_bonus
+        difference = abs(adjusted_qty - candidate_total)
+        
+        # Apply trend-based scoring to tolerance check
+        adjusted_difference = difference
+        if demand_trend_factor > 1.2 and candidate_total > adjusted_qty:
+            # Prefer higher quantities for increasing demand
+            adjusted_difference = difference * 0.7
+        elif demand_trend_factor < 0.8 and candidate_total < adjusted_qty:
+            # Prefer lower quantities for decreasing demand
+            adjusted_difference = difference * 0.7
+        
+        # Check if within tolerance
+        if adjusted_difference <= tolerance:
+            # Apply the multiplier (already rounded to 0.5 steps)
+            new_base = _round_to_half(candidate_base)
+            new_bonus = _round_to_half(candidate_bonus)
             
-            # Apply trend-based scoring
-            if demand_trend_factor > 1.2 and test_total > adjusted_qty:
-                # Prefer higher quantities for increasing demand
-                adjusted_difference = difference * 0.7
-            elif demand_trend_factor < 0.8 and test_total < adjusted_qty:
-                # Prefer lower quantities for decreasing demand
-                adjusted_difference = difference * 0.7
-            else:
-                adjusted_difference = difference
+            # Format values
+            base_str = str(int(new_base)) if new_base == int(new_base) else f"{new_base:.1f}"
+            bonus_str = str(int(new_bonus)) if new_bonus == int(new_bonus) else f"{new_bonus:.1f}"
             
-            # Check if within tolerance
-            if adjusted_difference <= tolerance and adjusted_difference < best_difference:
-                best_difference = adjusted_difference
-                best_multiplier = multiplier
-        
-        # Apply the best multiplier
-        new_base = _round_to_half(scheme_base * best_multiplier)
-        new_bonus = _round_to_half(scheme_bonus * best_multiplier)
-        
-        # EDGE CASE FIX: Ensure final sum is a whole number
-        total_sum = new_base + new_bonus
-        if total_sum != int(total_sum):
-            # Special handling for X+0.5 cases (e.g., 2+0.5, 3+0.5, 5+0.5)
-            if new_bonus == 0.5:
-                # Increase the base by 0.5 to make sum whole
-                # Examples: 2+0.5 → 2.5+0.5, 3+0.5 → 3.5+0.5, 5+0.5 → 5.5+0.5
-                new_base += 0.5
-            elif new_base == 0.5:
-                # If base is 0.5, increase bonus instead
-                new_bonus += 0.5
+            return f"{base_str}+{bonus_str}"
+        else:
+            # Not within tolerance, fall back to simple number
+            if adjusted_qty == int(adjusted_qty):
+                return str(int(adjusted_qty))
             else:
-                # General case: round to nearest whole number and distribute
-                target_sum = round(total_sum)
-                diff = target_sum - total_sum
-                
-                # Add the difference to the larger component
-                if new_base >= new_bonus:
-                    new_base += diff
-                else:
-                    new_bonus += diff
-        
-        # Format values
-        base_str = str(int(new_base)) if new_base == int(new_base) else f"{new_base:.1f}"
-        bonus_str = str(int(new_bonus)) if new_bonus == int(new_bonus) else f"{new_bonus:.1f}"
-        
-        return f"{base_str}+{bonus_str}"
+                return f"{adjusted_qty:.1f}"
         
     except (ValueError, TypeError, IndexError):
         # Fallback to simple number if scheme parsing fails
