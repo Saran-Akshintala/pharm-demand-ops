@@ -664,7 +664,8 @@ def apply_predicted_order_business_rules(df: pd.DataFrame) -> Tuple[pd.DataFrame
         
         # NEW BUSINESS RULE: Set "No Order" for rows with uneven sales pattern AND low values
         # This rule applies only when uneven_sales tooltip is already triggered
-        if 'uneven_sales' in conditions:
+        # EXCEPTION: Do NOT apply this rule when Stock == 0 (let the min(Predicted_Base, Sales_Qty) rule take precedence)
+        if 'uneven_sales' in conditions and not (pd.notna(stock_qty) and stock_qty == 0):
             # Get L90, Sales_Qty, and Stock values (handle column name variations)
             l90_value = None
             sales_qty_value = None
@@ -1008,6 +1009,24 @@ def apply_scheme_to_quantity(final_quantity: float, row: pd.Series, df: pd.DataF
                         new_base = round_to_half(candidate_base)
                         new_bonus = round_to_half(candidate_bonus)
                         
+                        # FIX: Ensure the sum is always a whole number and bonus is never 0
+                        # Never allow bonus to be 0
+                        if abs(new_bonus) < 0.01:
+                            return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
+                        
+                        # If bonus has a fractional part (like 0.5), add 0.5 to base to make total whole
+                        if new_bonus != int(new_bonus):
+                            # Extract fractional part of bonus (should be 0.5 based on rounding logic)
+                            bonus_fractional = new_bonus - int(new_bonus)
+                            # Add the same fractional amount to base to make total whole
+                            new_base = new_base + bonus_fractional
+                        
+                        # Final check: ensure total is a whole number
+                        new_total = new_base + new_bonus
+                        if abs(new_total - round(new_total)) > 0.001:
+                            adjustment = round(new_total) - new_total
+                            new_base = new_base + adjustment
+                        
                         return f"{format_value(new_base)}+{format_value(new_bonus)}"
                 else:
                     return str(int(final_quantity)) if final_quantity == int(final_quantity) else str(final_quantity)
@@ -1058,6 +1077,55 @@ def detect_uneven_sales_pattern(sales_values: list) -> bool:
     return uneven_ratio > 0.5
 
 
+def _detect_uneven_sales_for_row(row: pd.Series, df: pd.DataFrame) -> bool:
+    """
+    Detect if a row has high uneven sales pattern based on sales columns.
+    
+    Uses the same logic as apply_predicted_order_business_rules to detect
+    repeating patterns of 1s or 2s in sales history.
+    
+    Args:
+        row: Current row data
+        df: DataFrame containing the data (for column access)
+    
+    Returns:
+        True if row has high uneven sales pattern
+    """
+    sales_cols = ['L7', 'L15', 'L30', 'L45', 'L60', 'L75', 'L90']
+    available_sales = [col for col in sales_cols if col in df.columns]
+    
+    if not available_sales:
+        return False
+    
+    sales_values = [row.get(col, 0) for col in available_sales]
+    # Convert to numeric and handle NaN
+    sales_values = [pd.to_numeric(val, errors='coerce') for val in sales_values]
+    sales_values = [val for val in sales_values if pd.notna(val)]
+    
+    if not sales_values:
+        return False
+    
+    # Check for repeating patterns of 1 or 2
+    # Convert to int for proper comparison (handle numpy types)
+    sales_values_int = []
+    for val in sales_values:
+        try:
+            sales_values_int.append(int(val))
+        except (ValueError, TypeError):
+            pass
+    
+    ones_count = sales_values_int.count(1)
+    twos_count = sales_values_int.count(2)
+    total_values = len(sales_values_int)
+    
+    # If more than 50% are 1s or 2s, consider it uneven
+    if total_values > 0:
+        uneven_ratio = (ones_count + twos_count) / total_values
+        return uneven_ratio > 0.5
+    
+    return False
+
+
 def compute_predicted_order_with_adjustments(
     df: pd.DataFrame, 
     apply_box: bool = True, 
@@ -1085,26 +1153,33 @@ def compute_predicted_order_with_adjustments(
     """
     df_result = df.copy()
     
-    # Ensure Predicted_Base_Quantity exists
-    if 'Predicted_Base_Quantity' not in df_result.columns:
-        raise ValueError("Predicted_Base_Quantity column is required")
+    # Find the Predicted_Base_Quantity column (handle variations)
+    base_qty_col = None
+    for col in df_result.columns:
+        col_normalized = str(col).strip().replace(' ', '_').lower()
+        if col_normalized in ['predicted_base_quantity', 'predicted_base', 'predictedbase']:
+            base_qty_col = col
+            break
+    
+    if base_qty_col is None:
+        raise ValueError("Predicted_Base_Quantity (or Predicted_Base) column is required")
     
     predicted_orders = []
     
     for idx, row in df_result.iterrows():
-        base_qty = row.get('Predicted_Base_Quantity', 0)
+        base_qty = row.get(base_qty_col, 0)
         stock_qty = row.get('Stock', 0)
         
-        # Ensure values are numeric
-        if pd.isna(base_qty):
-            base_qty = 0
-        else:
-            base_qty = float(base_qty)
+        # Ensure values are numeric and explicitly convert
+        try:
+            base_qty = float(base_qty) if pd.notna(base_qty) else 0.0
+        except (ValueError, TypeError):
+            base_qty = 0.0
             
-        if pd.isna(stock_qty):
-            stock_qty = 0
-        else:
-            stock_qty = float(stock_qty)
+        try:
+            stock_qty = float(stock_qty) if pd.notna(stock_qty) else 0.0
+        except (ValueError, TypeError):
+            stock_qty = 0.0
         
         # Step 1: Predicted_Order = Predicted_Base_Quantity - Stock
         predicted_order_qty = base_qty - stock_qty
@@ -1112,6 +1187,80 @@ def compute_predicted_order_with_adjustments(
         # If result is negative or zero, handle appropriately
         if predicted_order_qty <= 0:
             predicted_orders.append("0")
+            continue
+        
+        # NEW BUSINESS RULE: If high uneven sales pattern AND Stock == 0,
+        # set Predicted_Order = min(Predicted_Base_Quantity, Sales_Qty)
+        # This rule executes before Box/Scm adjustments and SKIPS all further adjustments
+        uneven_sales_rule_applied = False
+        if stock_qty == 0:
+            # Check for uneven sales pattern
+            has_uneven_sales = _detect_uneven_sales_for_row(row, df_result)
+            
+            # DEBUG: Print detection result for rows with Stock=0
+            if has_uneven_sales and 'Name' in df_result.columns:
+                item_name = row.get('Name', 'Unknown')
+                print(f"DEBUG: Uneven sales detected for '{item_name}' | Stock={stock_qty} | Base={base_qty}")
+            
+            if has_uneven_sales:
+                # Get Sales_Qty (handle column name variations)
+                sales_qty_value = None
+                sales_qty_col = None
+                for col in df_result.columns:
+                    col_lower = str(col).lower().replace(' ', '_').replace('.', '')
+                    if col_lower == 'sales_qty' or col_lower == 'salesqty':
+                        sales_qty_col = col
+                        break
+                
+                if sales_qty_col:
+                    sales_qty_value = row.get(sales_qty_col)
+                
+                # Convert to numeric and apply the rule
+                sales_qty_num = None
+                if sales_qty_value is not None and pd.notna(sales_qty_value):
+                    try:
+                        sales_qty_num = pd.to_numeric(sales_qty_value, errors='coerce')
+                    except (ValueError, TypeError):
+                        pass
+                
+                # Apply the rule: min(Predicted_Base_Quantity, Sales_Qty)
+                # If Sales_Qty is not available or invalid, use Predicted_Base_Quantity directly
+                if sales_qty_num is not None and pd.notna(sales_qty_num) and sales_qty_num > 0:
+                    # Convert both to float to ensure proper comparison
+                    base_qty_float = float(base_qty)
+                    sales_qty_float = float(sales_qty_num)
+                    
+                    # DEBUG: Print the comparison
+                    if 'Name' in df_result.columns:
+                        item_name = row.get('Name', 'Unknown')
+                        print(f"DEBUG: Applying min rule for '{item_name}' | Base={base_qty_float} | Sales={sales_qty_float}")
+                    
+                    # Apply min() rule: take the SMALLER of the two values
+                    if base_qty_float <= sales_qty_float:
+                        predicted_order_qty = base_qty_float
+                    else:
+                        predicted_order_qty = sales_qty_float
+                    
+                    # DEBUG: Print result
+                    if 'Name' in df_result.columns:
+                        print(f"DEBUG: Result = {predicted_order_qty}")
+                else:
+                    # Sales_Qty not found or invalid, use base_qty directly
+                    predicted_order_qty = float(base_qty)
+                    if 'Name' in df_result.columns:
+                        item_name = row.get('Name', 'Unknown')
+                        print(f"DEBUG: Sales_Qty not found for '{item_name}', using base={predicted_order_qty}")
+                
+                uneven_sales_rule_applied = True
+        
+        # If uneven sales rule was applied, skip all adjustments and finalize immediately
+        if uneven_sales_rule_applied:
+            # Format as integer if whole number, otherwise as decimal
+            if predicted_order_qty == int(predicted_order_qty):
+                final_order = str(int(predicted_order_qty))
+            else:
+                final_order = f"{predicted_order_qty:.1f}"
+            predicted_orders.append(final_order)
             continue
         
         # Step 2: Apply box quantity adjustment if enabled
@@ -1312,6 +1461,30 @@ def _apply_scheme_adjustment_new(predicted_order_qty: float, row: pd.Series, df:
         candidate_bonus = scheme_bonus * rounded_m
         candidate_total = candidate_base + candidate_bonus
         
+        # FIX: Ensure the sum is always a whole number and bonus is never 0
+        # Never allow bonus to be 0
+        if abs(candidate_bonus) < 0.01:
+            # Bonus is effectively 0, don't use scheme format
+            if predicted_order_qty == int(predicted_order_qty):
+                return str(int(predicted_order_qty))
+            else:
+                return f"{predicted_order_qty:.1f}"
+        
+        # If bonus has a fractional part (like 0.5), add 0.5 to base to make total whole
+        if candidate_bonus != int(candidate_bonus):
+            # Extract fractional part of bonus (should be 0.5 based on rounding logic)
+            bonus_fractional = candidate_bonus - int(candidate_bonus)
+            # Add the same fractional amount to base to make total whole
+            candidate_base = candidate_base + bonus_fractional
+            candidate_total = candidate_base + candidate_bonus
+        
+        # Final check: ensure candidate_total is a whole number
+        # Round to nearest integer and adjust base accordingly
+        if abs(candidate_total - round(candidate_total)) > 0.001:
+            adjustment = round(candidate_total) - candidate_total
+            candidate_base = candidate_base + adjustment
+            candidate_total = candidate_base + candidate_bonus
+        
         # Use existing tolerance logic to decide if candidate is acceptable
         difference = abs(predicted_order_qty - candidate_total)
         
@@ -1448,6 +1621,27 @@ def _apply_scheme_adjustment(adjusted_qty: float, row: pd.Series, df: pd.DataFra
             # Apply the multiplier (already rounded to 0.5 steps)
             new_base = _round_to_half(candidate_base)
             new_bonus = _round_to_half(candidate_bonus)
+            
+            # FIX: Ensure the sum is always a whole number and bonus is never 0
+            # Never allow bonus to be 0
+            if abs(new_bonus) < 0.01:
+                if adjusted_qty == int(adjusted_qty):
+                    return str(int(adjusted_qty))
+                else:
+                    return f"{adjusted_qty:.1f}"
+            
+            # If bonus has a fractional part (like 0.5), add 0.5 to base to make total whole
+            if new_bonus != int(new_bonus):
+                # Extract fractional part of bonus (should be 0.5 based on rounding logic)
+                bonus_fractional = new_bonus - int(new_bonus)
+                # Add the same fractional amount to base to make total whole
+                new_base = new_base + bonus_fractional
+            
+            # Final check: ensure total is a whole number
+            new_total = new_base + new_bonus
+            if abs(new_total - round(new_total)) > 0.001:
+                adjustment = round(new_total) - new_total
+                new_base = new_base + adjustment
             
             # Format values
             base_str = str(int(new_base)) if new_base == int(new_base) else f"{new_base:.1f}"

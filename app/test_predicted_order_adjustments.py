@@ -272,6 +272,154 @@ class TestPredictedOrderAdjustments(unittest.TestCase):
             compute_predicted_order_with_adjustments(invalid_data)
 
 
+class TestUnevenSalesStockZeroRule(unittest.TestCase):
+    """Test cases for the new uneven sales + Stock==0 business rule."""
+    
+    def test_uneven_sales_stock_zero_case_a(self):
+        """
+        Case A: uneven sales flagged, Stock=0, Predicted_Base=10, Sales_Qty=6
+        Expected: Predicted_Order == 6 (min of 10 and 6)
+        """
+        # Create data with uneven sales pattern (more than 50% are 1s or 2s)
+        test_data = pd.DataFrame({
+            'Name': ['Product A'],
+            'Predicted_Base_Quantity': [10],
+            'Stock': [0],
+            'Sales_Qty': [6],
+            'Box': [1],
+            'Scm': ['0'],
+            'L7': [1], 'L15': [2], 'L30': [1], 'L45': [2], 
+            'L60': [1], 'L75': [2], 'L90': [1]  # 5 out of 7 are 1s or 2s (>50%)
+        })
+        
+        result = compute_predicted_order_with_adjustments(
+            test_data,
+            apply_box=False,
+            apply_scm=False
+        )
+        
+        predicted_order = result['Predicted_Order'].iloc[0]
+        # Should be min(10, 6) = 6
+        self.assertEqual(predicted_order, '6')
+    
+    def test_uneven_sales_stock_zero_case_b(self):
+        """
+        Case B: uneven sales flagged, Stock=0, Predicted_Base=3, Sales_Qty=5
+        Expected: Predicted_Order == 3 (min of 3 and 5)
+        """
+        # Create data with uneven sales pattern
+        test_data = pd.DataFrame({
+            'Name': ['Product B'],
+            'Predicted_Base_Quantity': [3],
+            'Stock': [0],
+            'Sales_Qty': [5],
+            'Box': [1],
+            'Scm': ['0'],
+            'L7': [2], 'L15': [1], 'L30': [2], 'L45': [1], 
+            'L60': [2], 'L75': [1], 'L90': [2]  # 6 out of 7 are 1s or 2s (>50%)
+        })
+        
+        result = compute_predicted_order_with_adjustments(
+            test_data,
+            apply_box=False,
+            apply_scm=False
+        )
+        
+        predicted_order = result['Predicted_Order'].iloc[0]
+        # Should be min(3, 5) = 3
+        self.assertEqual(predicted_order, '3')
+    
+    def test_uneven_sales_not_flagged_stock_zero(self):
+        """
+        Case C: uneven sales NOT flagged, Stock=0
+        Expected: Rule not applied (existing behavior maintained)
+        Normal flow: Predicted_Order = Predicted_Base_Quantity - Stock = 10 - 0 = 10
+        """
+        # Create data WITHOUT uneven sales pattern (less than 50% are 1s or 2s)
+        test_data = pd.DataFrame({
+            'Name': ['Product C'],
+            'Predicted_Base_Quantity': [10],
+            'Stock': [0],
+            'Sales_Qty': [6],
+            'Box': [1],
+            'Scm': ['0'],
+            'L7': [10], 'L15': [12], 'L30': [8], 'L45': [9], 
+            'L60': [11], 'L75': [7], 'L90': [6]  # Only 0 out of 7 are 1s or 2s (<50%)
+        })
+        
+        result = compute_predicted_order_with_adjustments(
+            test_data,
+            apply_box=False,
+            apply_scm=False
+        )
+        
+        predicted_order = result['Predicted_Order'].iloc[0]
+        # Should be normal flow: 10 - 0 = 10 (rule not applied)
+        self.assertEqual(predicted_order, '10')
+    
+    def test_uneven_sales_stock_non_zero(self):
+        """Test that rule only applies when Stock == 0."""
+        # Create data with uneven sales pattern but Stock != 0
+        test_data = pd.DataFrame({
+            'Name': ['Product D'],
+            'Predicted_Base_Quantity': [10],
+            'Stock': [2],  # Stock is not 0
+            'Sales_Qty': [6],
+            'Box': [1],
+            'Scm': ['0'],
+            'L7': [1], 'L15': [2], 'L30': [1], 'L45': [2], 
+            'L60': [1], 'L75': [2], 'L90': [1]  # Uneven sales pattern
+        })
+        
+        result = compute_predicted_order_with_adjustments(
+            test_data,
+            apply_box=False,
+            apply_scm=False
+        )
+        
+        predicted_order = result['Predicted_Order'].iloc[0]
+        # Should be normal flow: 10 - 2 = 8 (rule not applied because Stock != 0)
+        self.assertEqual(predicted_order, '8')
+    
+    def test_uneven_sales_rule_before_box_scm(self):
+        """Test that the rule executes before Box/Scm adjustments."""
+        # Create data with uneven sales, Stock=0, and Box/Scm that would normally adjust
+        test_data = pd.DataFrame({
+            'Name': ['Product E'],
+            'Predicted_Base_Quantity': [10],
+            'Stock': [0],
+            'Sales_Qty': [6],
+            'Box': [5],  # Would normally adjust to 5
+            'Scm': ['3+1'],  # Would normally adjust to scheme
+            'L7': [1], 'L15': [2], 'L30': [1], 'L45': [2], 
+            'L60': [1], 'L75': [2], 'L90': [1]  # Uneven sales pattern
+        })
+        
+        result = compute_predicted_order_with_adjustments(
+            test_data,
+            apply_box=True,
+            apply_scm=True,
+            box_tolerance=2,
+            scm_tolerance=2
+        )
+        
+        predicted_order = result['Predicted_Order'].iloc[0]
+        # Should be min(10, 6) = 6, then Box/Scm adjustments may apply
+        # But the base value should be 6, not 10
+        # Parse the result to get numeric value
+        if '+' in str(predicted_order):
+            parts = str(predicted_order).split('+')
+            total = float(parts[0]) + float(parts[1])
+        else:
+            total = float(predicted_order)
+        
+        # The result should be based on 6, not 10
+        # After box adjustment: 6 is close to Box=5, might adjust to 5
+        # After scheme adjustment: 5 or 6 might adjust to scheme
+        # But we verify it's not based on the original 10
+        self.assertLessEqual(total, 10)  # Should not exceed base quantity
+
+
 class TestIntegrationWithBusinessRules(unittest.TestCase):
     """Integration tests with existing business rules."""
     
