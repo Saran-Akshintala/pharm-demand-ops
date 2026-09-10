@@ -62,3 +62,11 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+
+# ⚠️ THIS REPOSITORY IS PUBLIC.
+# docs/ held a signed consulting engagement letter naming the client, its directors and the fee.
+# Moved to C:_Personal_Operations\Consulting_Engagements\ on 09-Sep-2026, before it was ever
+# committed. Contracts, invoices and anything under an NDA do not belong in a public repo -- the
+# confidentiality clause in that letter is binding, and a public push is not reversible.
+docs/
+*.docx
